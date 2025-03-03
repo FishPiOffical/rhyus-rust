@@ -1,0 +1,16 @@
+# 服务器配置
+[server]
+host = "0.0.0.0"
+port = 10831
+heartbeat_interval = 30  # 心跳间隔（秒）
+
+# WebSocket配置
+[websocket]
+master_url = "http://127.0.0.1:8080"  # 主服务器地址
+admin_key = "123456"  # 管理员密钥
+message_cache_size = 1024  # 消息缓存大小
+max_sessions_per_user = 10  # 每个用户最大会话数
+
+# 日志配置
+[log]
+level = "info" 
