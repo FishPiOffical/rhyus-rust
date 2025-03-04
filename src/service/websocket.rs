@@ -68,6 +68,7 @@ pub struct Hub {
     // 在线用户信息
     online_users: Arc<DashMap<String, i32>>,
     all_online_users: Arc<tokio::sync::RwLock<String>>,
+    client_online_users: Arc<tokio::sync::RwLock<String>>,
 }
 
 impl Hub {
@@ -91,6 +92,7 @@ impl Hub {
             clients: Arc::new(DashMap::new()),
             online_users: Arc::new(DashMap::new()),
             all_online_users: Arc::new(tokio::sync::RwLock::new("[]".to_string())),
+            client_online_users: Arc::new(tokio::sync::RwLock::new("{}".to_string())),
         };
 
         // 启动心跳检测和清理任务
@@ -249,23 +251,6 @@ impl Hub {
     async fn handle_master_message(&self, text: &str) {
         log::debug!(" <--- master: {}", text);
         
-        // 解析命令
-        if text.starts_with("push ") {
-            let content = text.replace("push ", "");
-            log::debug!("收到主服务器推送的在线用户列表");
-            
-            // 更新在线用户列表
-            *self.all_online_users.write().await = content.clone();
-            
-            // 格式化并广播给所有客户端
-            if let Some(client_format_str) = self.format_online_users_for_client(&content) {
-                log::debug!("广播主服务器推送的在线用户列表给所有客户端");
-                let _ = self.message_handler.client_out_tx.send(WsMessage::new(client_format_str));
-            }
-            
-            return;
-        }
-        
         if text.contains(":::") {
             let parts: Vec<&str> = text.split(":::").collect();
             if parts.len() == 2 && parts[0] == crate::conf::admin_key() {
@@ -293,11 +278,14 @@ impl Hub {
                             // 直接响应用户列表数组
                             let users_json = json!(online_users_vec).to_string();
                             log::debug!("响应主服务器 online 命令，发送用户列表: {}", users_json);
-                            let _ = self.message_handler.master_in_tx.send(WsMessage::new(users_json));
+                            let _ = self.message_handler.master_in_tx.send(WsMessage::new(users_json.clone()));
+                            
+                            // 更新本地缓存
+                            *self.all_online_users.write().await = users_json;
                         } else {
                             // 直接发送缓存的用户列表
                             log::debug!("发送缓存的在线用户列表: {}", online_users);
-                            let _ = self.message_handler.master_in_tx.send(WsMessage::new(online_users));
+                            let _ = self.message_handler.master_in_tx.send(WsMessage::new(online_users.clone()));
                         }
                     }
                     cmd if cmd.starts_with("tell") => {
@@ -336,6 +324,10 @@ impl Hub {
                     }
                     cmd if cmd.starts_with("push") => {
                         let content = &cmd[5..];
+                        log::debug!("收到主服务器push列表: {}", content);
+                        
+                        // 保存服务器推送的数据
+                        *self.client_online_users.write().await = content.to_string();
                         
                         // 解析在线用户列表并更新本地计数
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
@@ -344,59 +336,21 @@ impl Hub {
                                     // 清空当前在线用户计数
                                     self.online_users.clear();
                                     
-                                    // 提取用户信息并构建本地格式的用户列表
-                                    let mut local_users = Vec::new();
-                                    
                                     // 更新在线用户计数
                                     for user in users_array {
                                         if let Some(username) = user.get("userName").and_then(|v| v.as_str()) {
                                             self.online_users.insert(username.to_string(), 1);
-                                            
-                                            // 构建本地格式的用户信息
-                                            if let Some(client) = self.clients.iter().find(|entry| entry.value().user_info.user_name == username) {
-                                                local_users.push(client.value().user_info.clone());
-                                            } else {
-                                                // 如果本地没有该用户的完整信息，创建一个基本信息
-                                                let user_info = UserInfo {
-                                                    o_id: "".to_string(),
-                                                    user_name: username.to_string(),
-                                                    user_nickname: "".to_string(),
-                                                    user_url: "".to_string(),
-                                                    user_city: "".to_string(),
-                                                    user_intro: "".to_string(),
-                                                    user_online_flag: true,
-                                                    user_point: 0,
-                                                    user_role: "".to_string(),
-                                                    user_app_role: "".to_string(),
-                                                    user_avatar_url: user.get("userAvatarURL")
-                                                        .and_then(|v| v.as_str())
-                                                        .unwrap_or("")
-                                                        .to_string(),
-                                                    card_bg: "".to_string(),
-                                                    following_user_count: 0,
-                                                    follower_count: 0,
-                                                    online_minute: 0,
-                                                    can_follow: "".to_string(),
-                                                    all_metal_owned: "".to_string(),
-                                                    sys_metal: "{}".to_string(),
-                                                };
-                                                local_users.push(user_info);
-                                            }
                                         }
                                     }
-                                    
-                                    // 更新本地缓存，使用本地格式
-                                    let local_users_json = json!(local_users).to_string();
-                                    *self.all_online_users.write().await = local_users_json;
                                     
                                     log::debug!("更新在线用户列表，当前在线用户数: {}", users_array.len());
                                 }
                             }
                         }
                         
-                        // 广播给所有客户端
-                        self.broadcast_to_clients(WsMessage::with_delay(content.to_string(), Duration::from_secs(3)));
-                        
+                        // 直接广播给所有客户端
+                        let _ = self.message_handler.client_out_tx.send(WsMessage::new(content.to_string()));
+
                         if !self.masters.is_empty() {
                             let _ = self.message_handler.master_in_tx.send(WsMessage::new("OK"));
                         }
@@ -578,18 +532,15 @@ impl Hub {
         self.update_online_users_list().await;
 
         // 获取在线用户列表并发送给新连接的客户端
-        let all_online_users = self.all_online_users.read().await.clone();
+        let client_online_users = self.client_online_users.read().await.clone();
         
-        // 格式化并发送给新连接的客户端
-        if let Some(client_format_str) = self.format_online_users_for_client(&all_online_users) {
-            log::debug!("向新连接的客户端发送在线用户列表");
-            let online_message = WsMessage::with_delay(client_format_str, Duration::from_secs(3));
-            let _ = tx.send(online_message);
+        // 直接发送给新连接的客户端
+        if !client_online_users.is_empty() {
+            log::debug!("向新连接的客户端发送在线用户列表: {}", client_online_users);
+            let online_message = WsMessage::with_delay(client_online_users, Duration::from_secs(3));
+            let _ = self.message_handler.client_out_tx.send(online_message);
         } else {
-            // 如果格式化失败，直接发送原始数据
-            log::warn!("格式化在线用户列表失败，直接发送原始数据");
-            let online_message = WsMessage::with_delay(all_online_users.clone(), Duration::from_secs(3));
-            let _ = tx.send(online_message);
+            log::debug!("没有可用的在线用户列表发送给新客户端");
         }
 
         let (mut write, mut read) = socket.split();
@@ -754,41 +705,8 @@ impl Hub {
         let users_json = json!(online_users).to_string();
         *self.all_online_users.write().await = users_json.clone();
         
-        // 格式化并广播给所有客户端
-        if let Some(client_format_str) = self.format_online_users_for_client(&users_json) {
-            log::debug!("通过广播通道发送在线用户列表给所有客户端");
-            let _ = self.message_handler.client_out_tx.send(WsMessage::new(client_format_str));
-        }
     }
 
-    // 格式化在线用户列表，转换为客户端格式
-    fn format_online_users_for_client(&self, users_json: &str) -> Option<String> {
-        if let Ok(users_array) = serde_json::from_str::<serde_json::Value>(users_json) {
-            if users_array.is_array() {
-                // 构造客户端格式的用户列表
-                let client_format = json!({
-                    "discussing": "暂无",
-                    "onlineChatCnt": users_array.as_array().unwrap().len(),
-                    "type": "online",
-                    "users": users_array.as_array().unwrap().iter().map(|user| {
-                        let username = user["userName"].as_str().unwrap_or("");
-                        let avatar = user["userAvatarURL"].as_str().unwrap_or("");
-                        json!({
-                            "userAvatarURL": avatar,
-                            "userAvatarURL20": avatar,
-                            "userName": username,
-                            "userAvatarURL210": avatar,
-                            "homePage": format!("{}/member/{}", crate::conf::master_url(), username),
-                            "userAvatarURL48": avatar
-                        })
-                    }).collect::<Vec<_>>()
-                });
-                
-                return Some(client_format.to_string());
-            }
-        }
-        None
-    }
 }
 
 impl Clone for Hub {
@@ -800,6 +718,7 @@ impl Clone for Hub {
             clients: self.clients.clone(),
             online_users: self.online_users.clone(),
             all_online_users: self.all_online_users.clone(),
+            client_online_users: self.client_online_users.clone(),
         }
     }
 } 
