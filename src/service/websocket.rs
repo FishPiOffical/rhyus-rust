@@ -9,6 +9,8 @@ use crate::{common::AppResult, model::UserInfo, util, conf::Settings};
 use std::sync::Arc;
 use once_cell::sync::Lazy;
 use reqwest;
+use std::collections::VecDeque;
+use std::sync::Mutex;
 
 
 
@@ -55,6 +57,14 @@ struct MessageHandler {
     client_out_tx: broadcast::Sender<WsMessage>,
 }
 
+// 在 Hub 结构体前添加
+#[derive(Debug)]
+struct QueuedMessage {
+    sender: String,
+    content: String,
+    timestamp: SystemTime,
+}
+
 // WebSocket连接池
 pub struct Hub {
     // 主服务器连接相关
@@ -69,6 +79,10 @@ pub struct Hub {
     online_users: Arc<DashMap<String, i32>>,
     all_online_users: Arc<tokio::sync::RwLock<String>>,
     client_online_users: Arc<tokio::sync::RwLock<String>>,
+
+    // 消息队列相关
+    message_queue: Arc<Mutex<VecDeque<QueuedMessage>>>,
+    queue_sender: broadcast::Sender<()>, 
 }
 
 impl Hub {
@@ -79,6 +93,7 @@ impl Hub {
         let (master_tx, _) = broadcast::channel(message_cache_size);
         let (master_in_tx, _) = broadcast::channel(message_cache_size);
         let (client_out_tx, _) = broadcast::channel(message_cache_size);
+        let (queue_sender, _) = broadcast::channel(1);
 
         let message_handler = MessageHandler {
             master_in_tx,
@@ -93,6 +108,8 @@ impl Hub {
             online_users: Arc::new(DashMap::new()),
             all_online_users: Arc::new(tokio::sync::RwLock::new("[]".to_string())),
             client_online_users: Arc::new(tokio::sync::RwLock::new("{}".to_string())),
+            message_queue: Arc::new(Mutex::new(VecDeque::new())),
+            queue_sender,
         };
 
         // 启动心跳检测和清理任务
@@ -106,6 +123,9 @@ impl Hub {
             }
         });
 
+        // 启动消息队列处理器
+        hub.start_queue_processor();
+        
         hub
     }
 
@@ -186,65 +206,214 @@ impl Hub {
 
     // 发送消息给指定用户
     fn send_to_user(&self, username: &str, msg: WsMessage) {
-        let mut sent = false;
+        let hub = self.clone();
+        let msg_clone = msg.clone();
+        let username = username.to_string();
         
-        self.clients.iter().for_each(|entry| {
-            if entry.value().user_info.user_name == username {
-                match entry.value().tx.send(msg.clone()) {
+        tokio::spawn(async move {
+            let mut sent = false;
+            let mut failed_clients = Vec::new();
+            
+            // 收集用户的所有连接
+            let clients: Vec<_> = hub.clients.iter()
+                .filter(|entry| entry.value().user_info.user_name == username)
+                .map(|entry| (entry.key().clone(), entry.value().tx.clone()))
+                .collect();
+            
+            // 发送消息到用户的所有连接
+            for (addr, tx) in clients {
+                let msg = msg_clone.clone();
+                match tx.send(msg) {
                     Ok(_) => {
                         sent = true;
-                        log::debug!("消息已发送到用户 {}: {}", username, msg.data);
+                        log::debug!("消息已发送到用户 {}: {}", username, msg_clone.data);
                     }
                     Err(err) => {
                         log::error!("发送消息到 {} 失败: {}", username, err);
+                        failed_clients.push(addr);
                     }
                 }
             }
+            
+            // 清理发送失败的客户端
+            for addr in failed_clients {
+                if let Some(client) = hub.clients.get(&addr) {
+                    let username = client.value().user_info.user_name.clone();
+                    drop(client); // 释放锁
+                    
+                    if hub.clients.remove(&addr).is_some() {
+                        log::debug!("移除发送失败的客户端: {} ({})", username, addr);
+                        hub.remove_user_session(&username);
+                    }
+                }
+            }
+            
+            if !sent {
+                log::debug!("用户 {} 未找到或消息未发送", username);
+            }
         });
-        
-        if !sent {
-            log::debug!("用户 {} 未找到或消息未发送", username);
-        }
     }
 
-    // 广播消息给除指定用户外的所有客户端
-    fn broadcast_except_user(&self, username: &str, msg: WsMessage) {
-        let mut sent_count = 0;
+    // // 广播消息给除指定用户外的所有客户端
+    // fn broadcast_except_user(&self, username: &str, msg: WsMessage) {
+    //     let hub = self.clone();
+    //     let msg_clone = msg.clone();
+    //     let username = username.to_string();
         
-        self.clients.iter().for_each(|entry| {
-            if entry.value().user_info.user_name != username {
-                match entry.value().tx.send(msg.clone()) {
+    //     tokio::spawn(async move {
+    //         let mut sent_count = 0;
+    //         let mut failed_clients = Vec::new();
+            
+    //         // 收集需要发送的客户端
+    //         let clients: Vec<_> = hub.clients.iter()
+    //             .filter(|entry| entry.value().user_info.user_name != username)
+    //             .map(|entry| (entry.key().clone(), entry.value().tx.clone()))
+    //             .collect();
+            
+    //         // 并发发送消息
+    //         for (addr, tx) in clients {
+    //             let msg = msg_clone.clone();
+    //             match tx.send(msg) {
+    //                 Ok(_) => {
+    //                     sent_count += 1;
+    //                 }
+    //                 Err(err) => {
+    //                     if let Some(client) = hub.clients.get(&addr) {
+    //                         log::error!("发送消息失败 (除 {} 外): {} - {}", 
+    //                             username, client.value().user_info.user_name, err);
+    //                         failed_clients.push(addr);
+    //                     }
+    //                 }
+    //             }
+    //         }
+            
+    //         // 清理发送失败的客户端
+    //         for addr in failed_clients {
+    //             if let Some(client) = hub.clients.get(&addr) {
+    //                 let username = client.value().user_info.user_name.clone();
+    //                 drop(client); // 释放锁
+                    
+    //                 if hub.clients.remove(&addr).is_some() {
+    //                     log::debug!("移除发送失败的客户端: {} ({})", username, addr);
+    //                     hub.remove_user_session(&username);
+    //                 }
+    //             }
+    //         }
+            
+    //         log::debug!("广播消息已发送给 {} 个客户端 (除 {} 外)", sent_count, username);
+    //     });
+    // }
+    
+    // 广播消息给所有客户端
+    fn broadcast_to_clients(&self, msg: WsMessage) {
+        let hub = self.clone();
+        let msg_clone = msg.clone();
+        
+        tokio::spawn(async move {
+            let mut sent_count = 0;
+            let mut failed_clients = Vec::new();
+            
+            // 收集所有需要发送的客户端
+            let clients: Vec<_> = hub.clients.iter()
+                .map(|entry| (entry.key().clone(), entry.value().tx.clone()))
+                .collect();
+            
+            // 并发发送消息
+            for (addr, tx) in clients {
+                let msg = msg_clone.clone();
+                match tx.send(msg) {
                     Ok(_) => {
                         sent_count += 1;
                     }
                     Err(err) => {
-                        log::error!("发送消息失败 (除 {} 外): {} - {}", 
-                            username, entry.value().user_info.user_name, err);
+                        if let Some(client) = hub.clients.get(&addr) {
+                            log::error!("广播消息到 {} 失败: {}", 
+                                client.value().user_info.user_name, err);
+                            failed_clients.push(addr);
+                        }
+                    }
+                }
+            }
+            
+            // 清理发送失败的客户端
+            for addr in failed_clients {
+                if let Some(client) = hub.clients.get(&addr) {
+                    let username = client.value().user_info.user_name.clone();
+                    drop(client); // 释放锁
+                    
+                    if hub.clients.remove(&addr).is_some() {
+                        log::debug!("移除发送失败的客户端: {} ({})", username, addr);
+                        hub.remove_user_session(&username);
+                    }
+                }
+            }
+            
+            log::debug!("广播消息已发送给 {} 个客户端", sent_count);
+        });
+    }
+
+    // 启动消息队列处理器
+    fn start_queue_processor(&self) {
+        let hub = self.clone();
+        let mut queue_receiver = self.queue_sender.subscribe();
+        
+        tokio::spawn(async move {
+            loop {
+                // 等待新消息通知
+                let _ = queue_receiver.recv().await;
+                
+                // 处理队列中的消息
+                loop {
+                    let message = {
+                        let mut queue = hub.message_queue.lock().unwrap();
+                        queue.pop_front()
+                    };
+
+                    match message {
+                        Some(msg) => {
+                            // 发送消息给发送者
+                            hub.send_to_user(&msg.sender, WsMessage::new(&msg.content));
+                            
+                            // 延迟一小段时间后发送给其他用户
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            
+                            // 发送消息给其他用户
+                            let mut failed_clients = Vec::new();
+                            let clients: Vec<_> = hub.clients.iter()
+                                .filter(|entry| entry.value().user_info.user_name != msg.sender)
+                                .map(|entry| (entry.key().clone(), entry.value().tx.clone()))
+                                .collect();
+                            
+                            for (addr, tx) in clients {
+                                match tx.send(WsMessage::new(&msg.content)) {
+                                    Ok(_) => {},
+                                    Err(err) => {
+                                        log::error!("发送消息失败: {} - {}", addr, err);
+                                        failed_clients.push(addr);
+                                    }
+                                }
+                            }
+                            
+                            // 清理失败的客户端
+                            for addr in failed_clients {
+                                if let Some(client) = hub.clients.get(&addr) {
+                                    let username = client.value().user_info.user_name.clone();
+                                    drop(client);
+                                    if hub.clients.remove(&addr).is_some() {
+                                        log::debug!("移除发送失败的客户端: {} ({})", username, addr);
+                                        hub.remove_user_session(&username);
+                                    }
+                                }
+                            }
+                            
+                            // 处理完一条消息后短暂延迟，控制发送速率
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        },
+                        None => break,
                     }
                 }
             }
         });
-        
-        log::debug!("广播消息已发送给 {} 个客户端 (除 {} 外)", sent_count, username);
-    }
-    
-    // 广播消息给所有客户端
-    fn broadcast_to_clients(&self, msg: WsMessage) {
-        let mut sent_count = 0;
-        
-        self.clients.iter().for_each(|entry| {
-            match entry.value().tx.send(msg.clone()) {
-                Ok(_) => {
-                    sent_count += 1;
-                }
-                Err(err) => {
-                    log::error!("广播消息到 {} 失败: {}", 
-                        entry.value().user_info.user_name, err);
-                }
-            }
-        });
-        
-        log::debug!("广播消息已发送给 {} 个客户端", sent_count);
     }
 
     // 处理主服务器消息
@@ -304,10 +473,20 @@ impl Hub {
                         if parts.len() == 2 {
                             let sender = parts[0];
                             let content = parts[1];
-                            // 先发给发送者
-                            self.send_to_user(sender, WsMessage::new(content));
-                            // 再发给其他人
-                            self.broadcast_except_user(sender, WsMessage::with_delay(content, Duration::from_millis(10)));
+                            
+                            // 将消息添加到队列
+                            {
+                                let mut queue = self.message_queue.lock().unwrap();
+                                queue.push_back(QueuedMessage {
+                                    sender: sender.to_string(),
+                                    content: content.to_string(),
+                                    timestamp: SystemTime::now(),
+                                });
+                            }
+                            
+                            // 通知队列处理器
+                            let _ = self.queue_sender.send(());
+                            
                             if !self.masters.is_empty() {
                                 let _ = self.message_handler.master_in_tx.send(WsMessage::new("OK"));
                             }
@@ -515,42 +694,75 @@ impl Hub {
             last_active: SystemTime::now(),
         };
 
+        // 先更新连接计数和用户列表
+        let is_first_connection = count < 1;
         self.clients.insert(addr.clone(), client);
-
-        if count < 1 {
-            log::debug!("用户 {} 的第一个连接，通知主服务器用户加入", user_info.user_name);
-            if let Err(e) = util::post_message_to_master("join", &user_info.user_name).await {
-                log::error!("通知主服务器用户加入失败: {}", e);
-            } else {
-                log::debug!("已通知主服务器用户 {} 加入", user_info.user_name);
-            }
-        }
         self.online_users.insert(user_info.user_name.clone(), count + 1);
+        
+        // 异步处理用户加入通知和在线列表更新
+        let hub = self.clone();
+        let username = user_info.user_name.clone();
+        tokio::spawn(async move {
+            if is_first_connection {
+                log::debug!("用户 {} 的第一个连接，通知主服务器用户加入", username);
+                if let Err(e) = util::post_message_to_master("join", &username).await {
+                    log::error!("通知主服务器用户加入失败: {}", e);
+                } else {
+                    log::debug!("已通知主服务器用户 {} 加入", username);
+                }
+                
+                // 只在用户第一次连接时更新在线用户列表
+                hub.update_online_users_list().await;
+            }
+        });
+
         log::debug!("用户 {} 的连接计数: {} (连接ID: {})", user_info.user_name, count + 1, addr);
         log::debug!("当前在线用户总数: {}", self.online_users.len());
 
-        self.update_online_users_list().await;
-
-        // 获取在线用户列表并发送给新连接的客户端
+        // 异步发送在线用户列表给新连接的客户端
         let client_online_users = self.client_online_users.read().await.clone();
-        
-        // 直接发送给新连接的客户端
         if !client_online_users.is_empty() {
             log::debug!("向新连接的客户端发送在线用户列表: {}", client_online_users);
-            let online_message = WsMessage::with_delay(client_online_users, Duration::from_secs(3));
-            let _ = self.message_handler.client_out_tx.send(online_message);
+            // 使用延迟发送确保客户端已准备好接收消息
+            let hub = self.clone();
+            let addr = addr.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Some(client) = hub.clients.get(&addr) {
+                    match client.value().tx.send(WsMessage::new(client_online_users)) {
+                        Ok(_) => log::debug!("成功发送在线用户列表到客户端"),
+                        Err(e) => log::error!("发送在线用户列表失败: {}", e),
+                    }
+                }
+            });
         } else {
-            log::debug!("没有可用的在线用户列表发送给新客户端");
+            // 如果本地缓存为空，尝试从all_online_users获取
+            let all_online_users = self.all_online_users.read().await.clone();
+            if all_online_users != "[]" {
+                log::debug!("使用all_online_users发送在线用户列表: {}", all_online_users);
+                let hub = self.clone();
+                let addr = addr.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if let Some(client) = hub.clients.get(&addr) {
+                        match client.value().tx.send(WsMessage::new(all_online_users)) {
+                            Ok(_) => log::debug!("成功发送all_online_users列表到客户端"),
+                            Err(e) => log::error!("发送all_online_users列表失败: {}", e),
+                        }
+                    }
+                });
+            } else {
+                log::debug!("没有可用的在线用户列表发送给新客户端");
+            }
         }
 
         let (mut write, mut read) = socket.split();
-        
         let hub = self.clone();
         let addr_clone = addr.clone();
         let username_clone = user_info.user_name.clone();
-        
         let mut rx = tx.subscribe();
         
+        // 处理发送消息的任务
         let send_task = tokio::spawn(async move {
             while let Ok(msg) = rx.recv().await {
                 if let Some(delay) = msg.delay {
@@ -572,6 +784,7 @@ impl Hub {
             log::debug!("客户端消息发送任务结束: {} ({})", username_clone, addr_clone);
         });
         
+        // 处理接收消息的任务
         let hub_clone = hub.clone();
         let addr_clone2 = addr.clone();
         let username = user_info.user_name.clone();
@@ -596,23 +809,30 @@ impl Hub {
                 }
             }
             
-            if hub_clone.clients.remove(&addr_clone2).is_some() {
-                log::debug!("清理客户端连接: {} ({})", username, addr_clone2);
-            }
+            // 异步处理连接断开
+            let hub = hub_clone.clone();
+            let username = username.clone();
+            let addr = addr_clone2.clone();
             
-            let count = hub_clone.online_users.get(&username).map(|v| *v.value()).unwrap_or(0);
-            if count <= 1 {
-                log::debug!("用户 {} 的最后一个连接断开，通知主服务器用户离开", username);
-                if let Err(e) = util::post_message_to_master("leave", &username).await {
-                    log::error!("通知主服务器用户离开失败: {}", e);
+            tokio::spawn(async move {
+                if hub.clients.remove(&addr).is_some() {
+                    log::debug!("清理客户端连接: {} ({})", username, addr);
                 }
-                hub_clone.online_users.remove(&username);
                 
-                hub_clone.update_online_users_list().await;
-            } else {
-                hub_clone.online_users.insert(username.clone(), count - 1);
-                log::debug!("用户 {} 的连接计数更新为: {}", username, count - 1);
-            }
+                let count = hub.online_users.get(&username).map(|v| *v.value()).unwrap_or(0);
+                if count <= 1 {
+                    log::debug!("用户 {} 的最后一个连接断开，通知主服务器用户离开", username);
+                    if let Err(e) = util::post_message_to_master("leave", &username).await {
+                        log::error!("通知主服务器用户离开失败: {}", e);
+                    }
+                    hub.online_users.remove(&username);
+                    
+                    hub.update_online_users_list().await;
+                } else {
+                    hub.online_users.insert(username.clone(), count - 1);
+                    log::debug!("用户 {} 的连接计数更新为: {}", username, count - 1);
+                }
+            });
             
             send_task.abort();
         });
@@ -719,6 +939,8 @@ impl Clone for Hub {
             online_users: self.online_users.clone(),
             all_online_users: self.all_online_users.clone(),
             client_online_users: self.client_online_users.clone(),
+            message_queue: self.message_queue.clone(),
+            queue_sender: self.queue_sender.clone(),
         }
     }
 } 
