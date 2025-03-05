@@ -58,6 +58,7 @@ struct MessageHandler {
 }
 
 // 在 Hub 结构体前添加
+#[allow(dead_code)]
 #[derive(Debug)]
 struct QueuedMessage {
     sender: String,
@@ -108,7 +109,7 @@ impl Hub {
             online_users: Arc::new(DashMap::new()),
             all_online_users: Arc::new(tokio::sync::RwLock::new("[]".to_string())),
             client_online_users: Arc::new(tokio::sync::RwLock::new("{}".to_string())),
-            message_queue: Arc::new(Mutex::new(VecDeque::new())),
+            message_queue: Arc::new(Mutex::new(VecDeque::with_capacity(message_cache_size / 2))),
             queue_sender,
         };
 
@@ -132,65 +133,21 @@ impl Hub {
     async fn check_and_clean(&self) {
         let ping_message = WsMessage::new("{\"ping\":\"pong\"}");
         
-        // 清理超时连接（6小时无响应）
-        let timeout = Duration::from_secs(6 * 60 * 60);
-        let now = SystemTime::now();
-        
-        // 清理主服务器连接
+        // 只发送心跳消息并记录活跃连接数
         let mut master_num = 0;
-        self.masters.retain(|_, master| {
-            if let Ok(duration) = now.duration_since(master.last_active) {
-                if duration > timeout {
-                    return false;
-                }
-            }
-            let _ = master.tx.send(ping_message.clone());
-            master_num += 1;
-            true
-        });
-
-        // 清理客户端连接
         let mut client_num = 0;
-        let mut kicked_users = Vec::new();
-        self.clients.retain(|_, client| {
-            if let Ok(duration) = now.duration_since(client.last_active) {
-                if duration > timeout {
-                    kicked_users.push(client.user_info.user_name.clone());
-                    return false;
-                }
-            }
-            let _ = client.tx.send(ping_message.clone());
-            client_num += 1;
-            true
+        
+        // 主服务器心跳
+        self.masters.iter().for_each(|master| {
+            let _ = master.value().tx.send(ping_message.clone());
+            master_num += 1;
         });
 
-        // 更新在线用户计数并通知主服务器
-        let mut need_update_list = false;
-        for user in kicked_users {
-            if let Some(mut count) = self.online_users.get_mut(&user) {
-                *count -= 1;
-                if *count <= 0 {
-                    // 用户的最后一个连接断开，通知主服务器用户离开
-                    log::debug!("用户 {} 的最后一个连接超时断开，通知主服务器用户离开", user);
-                    let username = user.clone();  // 克隆用户名，避免移动
-                    tokio::spawn(async move {
-                        if let Err(e) = util::post_message_to_master("leave", &username).await {
-                            log::error!("通知主服务器用户离开失败: {}", e);
-                        }
-                    });
-                    self.online_users.remove(&user);
-                    need_update_list = true;
-                }
-            }
-        }
-
-        // 如果有用户被踢出，更新在线用户列表
-        if need_update_list {
-            let hub_clone = self.clone();
-            tokio::spawn(async move {
-                hub_clone.update_online_users_list().await;
-            });
-        }
+        // 客户端心跳
+        self.clients.iter().for_each(|client| {
+            let _ = client.value().tx.send(ping_message.clone());
+            client_num += 1;
+        });
 
         log::debug!("active master: {}, active client: {}", master_num, client_num);
     }
@@ -200,6 +157,15 @@ impl Hub {
             *count -= 1;
             if *count <= 0 {
                 self.online_users.remove(username);
+                // 用户的最后一个连接断开，通知主服务器用户离开
+                let username = username.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = util::post_message_to_master("leave", &username).await {
+                        log::error!("通知主服务器用户离开失败: {}", e);
+                    } else {
+                        log::debug!("已通知主服务器用户 {} 离开", username);
+                    }
+                });
             }
         }
     }
@@ -211,7 +177,7 @@ impl Hub {
         let username = username.to_string();
         
         tokio::spawn(async move {
-            let mut sent = false;
+            // let mut sent = false;
             let mut failed_clients = Vec::new();
             
             // 收集用户的所有连接
@@ -225,8 +191,8 @@ impl Hub {
                 let msg = msg_clone.clone();
                 match tx.send(msg) {
                     Ok(_) => {
-                        sent = true;
-                        log::debug!("消息已发送到用户 {}: {}", username, msg_clone.data);
+                        // sent = true;
+                        // log::debug!("消息已发送到用户 {}: {}", username, msg_clone.data);
                     }
                     Err(err) => {
                         log::error!("发送消息到 {} 失败: {}", username, err);
@@ -248,9 +214,9 @@ impl Hub {
                 }
             }
             
-            if !sent {
-                log::debug!("用户 {} 未找到或消息未发送", username);
-            }
+            // if !sent {
+            //     log::debug!("用户 {} 未找到或消息未发送", username);
+            // }
         });
     }
 
@@ -418,46 +384,36 @@ impl Hub {
 
     // 处理主服务器消息
     async fn handle_master_message(&self, text: &str) {
-        log::debug!(" <--- master: {}", text);
         
         if text.contains(":::") {
             let parts: Vec<&str> = text.split(":::").collect();
             if parts.len() == 2 && parts[0] == crate::conf::admin_key() {
                 match parts[1] {
                     "hello" => {
+                        log::debug!(" <--- master: {}", text);
                         let _ = self.message_handler.master_in_tx.send(WsMessage::new("hello from rhyus-rust"));
                     }
                     "online" => {
-                        // 获取本地维护的在线用户列表
-                        let online_users = self.all_online_users.read().await.clone();
-                        if online_users.is_empty() || online_users == "[]" {
-                            // 如果没有缓存的用户列表，则生成一个新的
-                            let mut online_users_map = std::collections::HashMap::new();
-                            let mut num = 0;
-                            self.clients.iter().for_each(|entry| {
-                                let user_info = entry.value().user_info.clone();
-                                online_users_map.insert(user_info.o_id.clone(), user_info);
-                                num += 1;
-                            });
-                            log::debug!("当前在线客户端数量: {}", num);
-                            
-                            let online_users_vec: Vec<UserInfo> = online_users_map.into_values().collect();
-                            log::debug!("去重后的在线用户数量: {}", online_users_vec.len());
-                            
-                            // 直接响应用户列表数组
-                            let users_json = json!(online_users_vec).to_string();
-                            log::debug!("响应主服务器 online 命令，发送用户列表: {}", users_json);
-                            let _ = self.message_handler.master_in_tx.send(WsMessage::new(users_json.clone()));
-                            
-                            // 更新本地缓存
-                            *self.all_online_users.write().await = users_json;
-                        } else {
-                            // 直接发送缓存的用户列表
-                            log::debug!("发送缓存的在线用户列表: {}", online_users);
-                            let _ = self.message_handler.master_in_tx.send(WsMessage::new(online_users.clone()));
-                        }
+
+                        // 直接收集所有连接的用户信息
+                        let mut online_users_vec = Vec::new();
+                        self.clients.iter().for_each(|entry| {
+                            let user_info = entry.value().user_info.clone();
+                            online_users_vec.push(json!({
+                                "userName": user_info.user_name,
+                                "userAvatarURL": user_info.user_avatar_url,
+                                "homePage": format!("/member/{}", user_info.user_name)
+                            }));
+                        });
+                        
+                        // 直接构建 JSONArray 并返回
+                        let users_json = serde_json::to_string(&online_users_vec).unwrap_or_else(|_| "[]".to_string());
+                        let _ = self.message_handler.master_in_tx.send(WsMessage::new(users_json.clone()));
+                        *self.all_online_users.write().await = users_json;
                     }
                     cmd if cmd.starts_with("tell") => {
+                        log::debug!(" <--- master: {}", text);
+
                         let parts: Vec<&str> = cmd[5..].splitn(2, ' ').collect();
                         if parts.len() == 2 {
                             let to = parts[0];
@@ -495,6 +451,8 @@ impl Hub {
                         }
                     }
                     cmd if cmd.starts_with("all") => {
+                        log::debug!(" <--- master: {}", text);
+
                         let content = &cmd[4..];
                         self.broadcast_to_clients(WsMessage::with_delay(content, Duration::from_millis(10)));
                         if !self.masters.is_empty() {
@@ -503,7 +461,7 @@ impl Hub {
                     }
                     cmd if cmd.starts_with("push") => {
                         let content = &cmd[5..];
-                        log::debug!("收到主服务器push列表: {}", content);
+                        // log::debug!("收到主服务器push列表: {}", content);
                         
                         // 保存服务器推送的数据
                         *self.client_online_users.write().await = content.to_string();
@@ -518,7 +476,13 @@ impl Hub {
                                     // 更新在线用户计数
                                     for user in users_array {
                                         if let Some(username) = user.get("userName").and_then(|v| v.as_str()) {
-                                            self.online_users.insert(username.to_string(), 1);
+                                            // 统计每个用户的连接数
+                                            let count = self.clients.iter()
+                                                .filter(|entry| entry.value().user_info.user_name == username)
+                                                .count() as i32;
+                                            if count > 0 {
+                                                self.online_users.insert(username.to_string(), count);
+                                            }
                                         }
                                     }
                                     
@@ -527,14 +491,20 @@ impl Hub {
                             }
                         }
                         
-                        // 直接广播给所有客户端
-                        let _ = self.message_handler.client_out_tx.send(WsMessage::new(content.to_string()));
-
                         if !self.masters.is_empty() {
                             let _ = self.message_handler.master_in_tx.send(WsMessage::new("OK"));
                         }
+                        
+                        // 异步广播给所有客户端
+                        let content = content.to_string();
+                        let hub = self.clone();
+                        tokio::spawn(async move {
+                            let _ = hub.message_handler.client_out_tx.send(WsMessage::new(content));
+                        });
                     }
                     cmd if cmd.starts_with("kick") => {
+                        log::debug!(" <--- master: {}", text);
+
                         let username = &cmd[5..];
                         let before_count = self.clients.len();
                         self.clients.retain(|_, client| {
@@ -554,6 +524,8 @@ impl Hub {
                         }
                     }
                     cmd if cmd == "clear" => {
+                        log::debug!(" <--- master: {}", text);
+
                         let mut cleared_users = Vec::new();
                         let now = SystemTime::now();
                         self.clients.retain(|_, client| {
@@ -717,43 +689,28 @@ impl Hub {
         });
 
         log::debug!("用户 {} 的连接计数: {} (连接ID: {})", user_info.user_name, count + 1, addr);
-        log::debug!("当前在线用户总数: {}", self.online_users.len());
+        // log::debug!("当前在线用户总数: {}", self.online_users.len());
 
         // 异步发送在线用户列表给新连接的客户端
         let client_online_users = self.client_online_users.read().await.clone();
-        if !client_online_users.is_empty() {
-            log::debug!("向新连接的客户端发送在线用户列表: {}", client_online_users);
-            // 使用延迟发送确保客户端已准备好接收消息
+        let users_list = if !client_online_users.is_empty() {
+            client_online_users
+        } else {
+            self.all_online_users.read().await.clone()
+        };
+
+        if users_list != "[]" {
             let hub = self.clone();
             let addr = addr.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 if let Some(client) = hub.clients.get(&addr) {
-                    match client.value().tx.send(WsMessage::new(client_online_users)) {
+                    match client.value().tx.send(WsMessage::new(users_list)) {
                         Ok(_) => log::debug!("成功发送在线用户列表到客户端"),
                         Err(e) => log::error!("发送在线用户列表失败: {}", e),
                     }
                 }
             });
-        } else {
-            // 如果本地缓存为空，尝试从all_online_users获取
-            let all_online_users = self.all_online_users.read().await.clone();
-            if all_online_users != "[]" {
-                log::debug!("使用all_online_users发送在线用户列表: {}", all_online_users);
-                let hub = self.clone();
-                let addr = addr.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    if let Some(client) = hub.clients.get(&addr) {
-                        match client.value().tx.send(WsMessage::new(all_online_users)) {
-                            Ok(_) => log::debug!("成功发送all_online_users列表到客户端"),
-                            Err(e) => log::error!("发送all_online_users列表失败: {}", e),
-                        }
-                    }
-                });
-            } else {
-                log::debug!("没有可用的在线用户列表发送给新客户端");
-            }
         }
 
         let (mut write, mut read) = socket.split();
@@ -826,7 +783,7 @@ impl Hub {
                         log::error!("通知主服务器用户离开失败: {}", e);
                     }
                     hub.online_users.remove(&username);
-                    
+                    hub.remove_user_session(&username);
                     hub.update_online_users_list().await;
                 } else {
                     hub.online_users.insert(username.clone(), count - 1);
