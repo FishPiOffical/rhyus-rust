@@ -10,6 +10,5 @@ build-cross.ps1
 build-musl.ps1
 copy_binary.ps1
 Dockerfile
-output/config.toml
-output/rhyus-rust
+output/
 websocket-test.yml
