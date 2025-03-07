@@ -596,7 +596,7 @@ impl Hub {
                             "{}".to_string()
                         } else {
                             let pairs: Vec<String> = inactive_users.iter()
-                                .map(|(k, v)| format!("{}={}", k, v))
+                                .map(|(k, v)| format!("{}:{}", k, v))
                                 .collect();
                             format!("{{{}}}", pairs.join(", "))
                         };
