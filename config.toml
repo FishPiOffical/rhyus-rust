@@ -10,6 +10,8 @@ master_url = "http://127.0.0.1:8080"  # 主服务器地址
 admin_key = "123456"  # 管理员密钥
 message_cache_size = 1024  # 消息缓存大小
 max_sessions_per_user = 10  # 每个用户最大会话数
+message_send_delay_ms = 10  # 消息发送延迟（毫秒）
+queue_channel_capacity = 100 # 默认队列通道容量
 
 # 日志配置
 [log]

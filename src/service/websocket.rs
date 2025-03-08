@@ -72,6 +72,33 @@ struct QueuedMessage {
     timestamp: SystemTime,
 }
 
+// 消息队列统计
+struct MsgQueueStats {
+    total_msgs: u64,         // 收到的消息总数
+    processed_msgs: u64,     // 处理的消息总数
+    broadcast_msgs: u64,     // 广播出去的消息总数
+    queue_max_size: usize,   // 队列最大长度
+    last_msg_time: SystemTime, // 最后处理消息的时间
+    last_msg_content: String,  // 最后处理的消息内容
+    connection_count: usize,   // 当前连接数量
+    send_duration_ms: u64,     // 发送持续时间(毫秒)
+}
+
+impl MsgQueueStats {
+    fn new() -> Self {
+        Self {
+            total_msgs: 0,
+            processed_msgs: 0,
+            broadcast_msgs: 0,
+            queue_max_size: 0,
+            last_msg_time: SystemTime::now(),
+            last_msg_content: String::new(),
+            connection_count: 0,
+            send_duration_ms: 0,
+        }
+    }
+}
+
 // WebSocket连接池
 pub struct Hub {
     // 主服务器连接相关
@@ -89,7 +116,10 @@ pub struct Hub {
 
     // 消息队列相关
     message_queue: Arc<Mutex<VecDeque<QueuedMessage>>>,
-    queue_sender: broadcast::Sender<()>, 
+    queue_sender: broadcast::Sender<()>,
+    
+    // 消息队列统计
+    msg_stats: Arc<tokio::sync::RwLock<MsgQueueStats>>,
 }
 
 impl Hub {
@@ -99,7 +129,7 @@ impl Hub {
         
         let (master_tx, _) = broadcast::channel(message_cache_size);
         let (client_out_tx, _) = broadcast::channel(message_cache_size);
-        let (queue_sender, _) = broadcast::channel(1);
+        let (queue_sender, _) = broadcast::channel(config.websocket.queue_channel_capacity);
 
         let message_handler = MessageHandler {
             client_out_tx,
@@ -115,6 +145,7 @@ impl Hub {
             client_online_users: Arc::new(tokio::sync::RwLock::new("{}".to_string())),
             message_queue: Arc::new(Mutex::new(VecDeque::with_capacity(message_cache_size / 2))),
             queue_sender,
+            msg_stats: Arc::new(tokio::sync::RwLock::new(MsgQueueStats::new())),
         };
 
         // 启动心跳检测和清理任务
@@ -130,6 +161,8 @@ impl Hub {
 
         // 启动消息队列处理器
         hub.start_queue_processor();
+        
+        hub.start_msg_stats_monitor();
         
         hub
     }
@@ -182,7 +215,7 @@ impl Hub {
         
         tokio::spawn(async move {
             let mut failed_clients = Vec::new();
-            let mut sent = false;
+            // let mut sent = false;
             
             // 尝试向用户的所有连接发送消息
             for entry in hub.clients.iter() {
@@ -191,8 +224,6 @@ impl Hub {
                     if let Err(e) = client.tx.send(msg_clone.clone()) {
                         log::error!("向用户 {} 发送消息失败: {}", username, e);
                         failed_clients.push(entry.key().clone());
-                    } else {
-                        sent = true;
                     }
                 }
             }
@@ -202,9 +233,9 @@ impl Hub {
                 hub.clients.remove(&key);
             }
             
-            if !sent {
-                log::error!("用户 {} 不在线或消息发送全部失败", username);
-            }
+            // if !sent {
+            //     log::error!("用户 {} 不在线或消息发送全部失败", username);
+            // }
         });
     }
 
@@ -241,61 +272,110 @@ impl Hub {
     // 启动消息队列处理器
     fn start_queue_processor(&self) {
         let hub = self.clone();
-        let mut queue_receiver = self.queue_sender.subscribe();
+        let mut rx = self.queue_sender.subscribe();
         
         tokio::spawn(async move {
             loop {
-                // 等待新消息通知
-                let _ = queue_receiver.recv().await;
-                
-                // 处理队列中的消息
-                loop {
-                    let message = {
-                        let mut queue = hub.message_queue.lock().unwrap();
-                        queue.pop_front()
-                    };
-
-                    match message {
-                        Some(msg) => {
-                            // 发送消息给发送者
-                            hub.send_to_user(&msg.sender, WsMessage::new(&msg.content));
-                            
-                            // 延迟一小段时间后发送给其他用户
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                            
-                            // 发送消息给其他用户
-                            let mut failed_clients = Vec::new();
+                // 等待队列通知
+                if rx.recv().await.is_ok() {
+                    // 检查队列中是否有消息
+                    loop {
+                        let has_message = {
+                            let queue = hub.message_queue.lock().unwrap();
+                            !queue.is_empty()
+                        };
+                        
+                        if !has_message {
+                            break;
+                        }
+                        
+                        let message = {
+                            let mut queue = hub.message_queue.lock().unwrap();
+                            queue.pop_front()
+                        };
+                        
+                        if let Some(msg) = message {
+                            // 收集所有客户端连接
                             let clients: Vec<_> = hub.clients.iter()
-                                .filter(|entry| entry.value().user_info.user_name != msg.sender)
-                                .map(|entry| (entry.key().clone(), entry.value().tx.clone()))
+                                .map(|entry| (
+                                    entry.key().clone(), 
+                                    entry.value().user_info.user_name.clone(),
+                                    entry.value().tx.clone()
+                                ))
                                 .collect();
                             
-                            for (addr, tx) in clients {
-                                match tx.send(WsMessage::new(&msg.content)) {
-                                    Ok(_) => {},
-                                    Err(err) => {
-                                        log::error!("发送消息失败: {} - {}", addr, err);
-                                        failed_clients.push(addr);
+                            let connection_count = clients.len();
+                            let start_time = SystemTime::now();
+                            
+                            // 更新统计信息
+                            {
+                                let mut stats = hub.msg_stats.write().await;
+                                stats.processed_msgs += 1;
+                                stats.broadcast_msgs += connection_count as u64;
+                                stats.last_msg_time = start_time;
+                                stats.last_msg_content = msg.content.clone();
+                                stats.connection_count = connection_count;
+                            }
+                            
+                            log::debug!("开始发送消息给 {} 个连接", connection_count);
+                            
+                            let sender = &msg.sender;
+
+                            for (addr, username, tx) in &clients {
+                                if username == sender {
+                                    if let Err(err) = tx.send(WsMessage::new(&msg.content)) {
+                                        log::error!("发送消息给发送者失败: {} - {}", username, err);
+                                        // 移除失败的客户端
+                                        if hub.clients.remove(addr).is_some() {
+                                            hub.remove_user_session(username);
+                                        }
                                     }
+                                    break;
                                 }
                             }
                             
-                            // 清理失败的客户端
-                            for addr in failed_clients {
-                                if let Some(client) = hub.clients.get(&addr) {
-                                    let username = client.value().user_info.user_name.clone();
-                                    drop(client);
-                                    if hub.clients.remove(&addr).is_some() {
-                                        log::debug!("移除发送失败的客户端: {} ({})", username, addr);
-                                        hub.remove_user_session(&username);
-                                    }
+                            // if !sender_found {
+                            //     log::error!("消息发送者 {} 不在线", sender);
+                            // }
+                            
+                            let mut success_count = 0;
+                            let mut failed_clients = Vec::new();
+                            
+                            for (addr, username, tx) in clients {
+                                if &username == sender {
+                                    continue;
+                                }
+                                
+                                if let Err(err) = tx.send(WsMessage::new(&msg.content)) {
+                                    log::error!("发送消息给客户端失败: {} - {}", username, err);
+                                    failed_clients.push((addr, username));
+                                } else {
+                                    success_count += 1;
+                                    
+                                    let delay_ms = crate::conf::Settings::global().websocket.message_send_delay_ms;
+                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                                 }
                             }
                             
-                            // 处理完一条消息后短暂延迟，控制发送速率
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        },
-                        None => break,
+                            // 移除失败的客户端
+                            for (addr, username) in failed_clients {
+                                if hub.clients.remove(&addr).is_some() {
+                                    hub.remove_user_session(&username);
+                                }
+                            }
+                            
+                            // 计算发送持续时间
+                            let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
+                            let duration_ms = duration.as_millis() as u64;
+                            
+                            // 更新发送时间统计
+                            {
+                                let mut stats = hub.msg_stats.write().await;
+                                stats.send_duration_ms = duration_ms;
+                            }
+                            
+                            log::debug!("消息发送完成，成功发送给 {} 个连接，耗时 {}ms", success_count, duration_ms);
+                        }
                     }
                 }
             }
@@ -310,6 +390,47 @@ impl Hub {
             let mut rx = hub.message_handler.client_out_tx.subscribe();
             while let Ok(msg) = rx.recv().await {
                 hub.broadcast_to_clients(msg);
+            }
+        });
+    }
+
+    // 消息统计监控
+    fn start_msg_stats_monitor(&self) {
+        let hub = self.clone();
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            
+            loop {
+                interval.tick().await;
+                
+                // 获取当前队列大小
+                let queue_size = {
+                    let queue = hub.message_queue.lock().unwrap();
+                    queue.len()
+                };
+                
+                // 获取连接数量
+                let connection_count = hub.clients.len();
+                
+                // 获取统计信息
+                let stats = hub.msg_stats.read().await;
+                
+                // 计算平均每条消息的广播数
+                let avg_broadcast = if stats.processed_msgs > 0 {
+                    stats.broadcast_msgs as f64 / stats.processed_msgs as f64
+                } else {
+                    0.0
+                };
+                
+                log::debug!("消息队列统计 - 收到消息: {}, 处理消息: {}, 广播消息: {}, 平均广播: {:.2}", 
+                    stats.total_msgs, stats.processed_msgs, stats.broadcast_msgs, avg_broadcast);
+                
+                log::debug!("连接统计 - 当前连接数: {}, 最后发送耗时: {}ms", 
+                    connection_count, stats.send_duration_ms);
+                
+                log::debug!("队列状态 - 最大长度: {}, 当前长度: {}", stats.queue_max_size, queue_size);
+                
             }
         });
     }
@@ -595,10 +716,8 @@ impl Hub {
                         let response = if inactive_users.is_empty() {
                             "{}".to_string()
                         } else {
-                            let pairs: Vec<String> = inactive_users.iter()
-                                .map(|(k, v)| format!("{}:{}", k, v))
-                                .collect();
-                            format!("{{{}}}", pairs.join(", "))
+                            let pairs = serde_json::to_string(&inactive_users).unwrap_or_else(|_| "{}".to_string());
+                            pairs
                         };
                         
                         if let Err(e) = socket.send(Message::Text(response)).await {
@@ -649,14 +768,24 @@ impl Hub {
                             let sender = parts[0];
                             let content = parts[1];
                             
-                            // 将消息添加到队列
-                            {
+                            // 将消息添加到队列并获取队列大小
+                            let queue_size = {
                                 let mut queue = self.message_queue.lock().unwrap();
                                 queue.push_back(QueuedMessage {
                                     sender: sender.to_string(),
                                     content: content.to_string(),
                                     timestamp: SystemTime::now(),
                                 });
+                                queue.len()
+                            };
+                            
+                            // 更新统计信息
+                            {
+                                let mut stats = self.msg_stats.write().await;
+                                stats.total_msgs += 1;
+                                if queue_size > stats.queue_max_size {
+                                    stats.queue_max_size = queue_size;
+                                }
                             }
                             
                             // 通知队列处理器
@@ -802,6 +931,7 @@ impl Clone for Hub {
             client_online_users: self.client_online_users.clone(),
             message_queue: self.message_queue.clone(),
             queue_sender: self.queue_sender.clone(),
+            msg_stats: self.msg_stats.clone(),
         }
     }
 } 

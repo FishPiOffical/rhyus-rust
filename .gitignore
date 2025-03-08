@@ -12,3 +12,9 @@ copy_binary.ps1
 Dockerfile
 output/
 websocket-test.yml
+build-windows-static.ps1
+create_user.py
+interrupted_test_results.txt
+link_client.py
+no_message_connections.txt
+ws_test.log

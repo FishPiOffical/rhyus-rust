@@ -25,6 +25,8 @@ pub struct WebSocketConfig {
     pub admin_key: String,       // 管理员密钥
     pub message_cache_size: usize, // 消息缓存大小
     pub max_sessions_per_user: usize, // 每个用户最大会话数
+    pub message_send_delay_ms: u64, // 消息发送延迟（毫秒）
+    pub queue_channel_capacity: usize, // 队列通知通道容量
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -54,6 +56,8 @@ impl Settings {
                 admin_key: "123456".to_string(),
                 message_cache_size: 1024,
                 max_sessions_per_user: 10,
+                message_send_delay_ms: 10, // 默认10毫秒延迟
+                queue_channel_capacity: 100, // 默认队列通道容量
             },
             log: LogConfig {
                 level: "info".to_string(),
