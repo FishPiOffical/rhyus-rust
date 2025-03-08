@@ -228,10 +228,10 @@ impl Hub {
                 }
             }
             
-            // 移除发送失败的客户端
-            for key in failed_clients {
-                hub.clients.remove(&key);
-            }
+            // // 移除发送失败的客户端
+            // for key in failed_clients {
+            //     hub.clients.remove(&key);
+            // }
             
             // if !sent {
             //     log::error!("用户 {} 不在线或消息发送全部失败", username);
@@ -258,10 +258,10 @@ impl Hub {
                 }
             }
             
-            // 移除发送失败的客户端
-            for key in failed_clients {
-                hub.clients.remove(&key);
-            }
+            // // 移除发送失败的客户端
+            // for key in failed_clients {
+            //     hub.clients.remove(&key);
+            // }
             
             if hub.clients.len() > 0 && sent_count == 0 {
                 log::error!("广播消息全部失败，总客户端数: {}", hub.clients.len());
@@ -357,12 +357,12 @@ impl Hub {
                                 }
                             }
                             
-                            // 移除失败的客户端
-                            for (addr, username) in failed_clients {
-                                if hub.clients.remove(&addr).is_some() {
-                                    hub.remove_user_session(&username);
-                                }
-                            }
+                            // // 移除失败的客户端
+                            // for (addr, username) in failed_clients {
+                            //     if hub.clients.remove(&addr).is_some() {
+                            //         hub.remove_user_session(&username);
+                            //     }
+                            // }
                             
                             // 计算发送持续时间
                             let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
