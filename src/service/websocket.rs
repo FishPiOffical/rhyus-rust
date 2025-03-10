@@ -349,30 +349,11 @@ impl Hub {
                             log::debug!("开始发送消息给 {} 个连接", connection_count);
                             
                             let sender = &msg.sender;
-                            let mut sender_found = false;
-
-                            for (addr, username, tx) in &clients {
-                                if username == sender {
-                                    if let Err(err) = tx.send(WsMessage::new(&msg.content)) {
-                                        log::error!("发送消息给发送者失败: {} - {} - {}", addr, username, err);
-                                    } else {
-                                        sender_found = true;
-                                    }
-                                    break;
-                                }
-                            }
-                            
-                            if !sender_found {
-                                log::debug!("消息发送者 {} 不在本节点", sender);
-                            }
-                            
                             let mut success_count = 0;
                             let mut failed_clients = Vec::new();
                             
-                            // 发送给其他所有客户端
                             for (addr, username, tx) in clients {
-                                if &username == sender && sender_found {
-                                    success_count += 1;
+                                if &username == sender {
                                     continue;
                                 }
                                 
@@ -799,7 +780,24 @@ impl Hub {
                             let sender = parts[0];
                             let content = parts[1];
                             
-                            // 将消息添加到队列并获取队列大小
+                            let mut sender_found = false;
+                            for entry in self.clients.iter() {
+                                if entry.value().user_info.user_name == sender {
+                                    if let Err(err) = entry.value().tx.send(WsMessage::new(content)) {
+                                        log::error!("直接发送消息给发送者失败: {} - {}", sender, err);
+                                    } else {
+                                        sender_found = true;
+                                        log::debug!("已直接发送消息给发送者: {}", sender);
+                                    }
+                                    break;
+                                }
+                            }
+                            
+                            if !sender_found {
+                                log::debug!("发送者 {} 不在本节点", sender);
+                            }
+                            
+                            // 将消息添加到队列
                             let queue_size = {
                                 let mut queue = self.message_queue.lock().unwrap();
                                 queue.push_back(QueuedMessage {
