@@ -348,14 +348,14 @@ impl Hub {
                             
                             log::debug!("开始发送消息给 {} 个连接", connection_count);
                             
-                            let sender = &msg.sender;
+                            // let sender = &msg.sender;
                             let mut success_count = 0;
                             let mut failed_clients = Vec::new();
                             
                             for (addr, username, tx) in clients {
-                                if &username == sender {
-                                    continue;
-                                }
+                                // if &username == sender {
+                                //     continue;
+                                // }
                                 
                                 if let Err(err) = tx.send(WsMessage::new(&msg.content)) {
                                     log::error!("发送消息给客户端失败: {} - {}", username, err);
