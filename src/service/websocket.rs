@@ -189,22 +189,51 @@ impl Hub {
         log::debug!("active master: {}, active client: {}", master_num, client_num);
     }
 
-    pub fn remove_user_session(&self, username: &str) {
-        if let Some(mut count) = self.online_users.get_mut(username) {
-            *count -= 1;
-            if *count <= 0 {
-                self.online_users.remove(username);
-                // 用户的最后一个连接断开，通知主服务器用户离开
-                let username = username.to_string();
-                tokio::spawn(async move {
-                    if let Err(e) = util::post_message_to_master("leave", &username).await {
-                        log::error!("通知主服务器用户离开失败: {}", e);
-                    } else {
-                        log::debug!("已通知主服务器用户 {} 离开", username);
-                    }
-                });
+    // pub fn remove_user_session(&self, username: &str) {
+    //     if let Some(mut count) = self.online_users.get_mut(username) {
+    //         *count -= 1;
+    //         if *count <= 0 {
+    //             self.online_users.remove(username);
+    //             // 用户的最后一个连接断开，通知主服务器用户离开
+    //             let username = username.to_string();
+    //             tokio::spawn(async move {
+    //                 if let Err(e) = util::post_message_to_master("leave", &username).await {
+    //                     log::error!("通知主服务器用户离开失败: {}", e);
+    //                 } else {
+    //                     log::debug!("已通知主服务器用户 {} 离开", username);
+    //                 }
+    //             });
+    //         }
+    //     }
+    // }
+
+    // 强制移除用户的所有连接
+    pub fn force_remove_user(&self, username: &str) {
+        // 收集需要移除的连接地址
+        let mut addresses_to_remove = Vec::new();
+        self.clients.iter().for_each(|entry| {
+            if entry.value().user_info.user_name == username {
+                addresses_to_remove.push(entry.key().clone());
             }
+        });
+        
+        // 移除所有连接
+        for addr in addresses_to_remove {
+            self.clients.remove(&addr);
         }
+        
+        // 移除用户计数
+        self.online_users.remove(username);
+        
+        // 通知主服务器用户离开
+        let username = username.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = util::post_message_to_master("leave", &username).await {
+                log::error!("通知主服务器用户离开失败: {}", e);
+            } else {
+                log::debug!("已通知主服务器用户 {} 离开", username);
+            }
+        });
     }
 
     // 发送消息给指定用户
@@ -320,29 +349,30 @@ impl Hub {
                             log::debug!("开始发送消息给 {} 个连接", connection_count);
                             
                             let sender = &msg.sender;
+                            let mut sender_found = false;
 
                             for (addr, username, tx) in &clients {
                                 if username == sender {
                                     if let Err(err) = tx.send(WsMessage::new(&msg.content)) {
-                                        log::error!("发送消息给发送者失败: {} - {}", username, err);
-                                        // 移除失败的客户端
-                                        if hub.clients.remove(addr).is_some() {
-                                            hub.remove_user_session(username);
-                                        }
+                                        log::error!("发送消息给发送者失败: {} - {} - {}", addr, username, err);
+                                    } else {
+                                        sender_found = true;
                                     }
                                     break;
                                 }
                             }
                             
-                            // if !sender_found {
-                            //     log::error!("消息发送者 {} 不在线", sender);
-                            // }
+                            if !sender_found {
+                                log::debug!("消息发送者 {} 不在本节点", sender);
+                            }
                             
                             let mut success_count = 0;
                             let mut failed_clients = Vec::new();
                             
+                            // 发送给其他所有客户端
                             for (addr, username, tx) in clients {
-                                if &username == sender {
+                                if &username == sender && sender_found {
+                                    success_count += 1;
                                     continue;
                                 }
                                 
@@ -563,6 +593,10 @@ impl Hub {
             let addr = addr_clone2.clone();
             
             tokio::spawn(async move {
+                // 先中止发送任务，确保不会继续向已断开的连接发送消息
+                send_task.abort();
+                
+                // 移除客户端连接
                 if hub.clients.remove(&addr).is_some() {
                     log::debug!("清理客户端连接: {} ({})", username, addr);
                 }
@@ -570,19 +604,14 @@ impl Hub {
                 let count = hub.online_users.get(&username).map(|v| *v.value()).unwrap_or(0);
                 if count <= 1 {
                     log::debug!("用户 {} 的最后一个连接断开，通知主服务器用户离开", username);
-                    if let Err(e) = util::post_message_to_master("leave", &username).await {
-                        log::error!("通知主服务器用户离开失败: {}", e);
-                    }
                     hub.online_users.remove(&username);
-                    hub.remove_user_session(&username);
+                    hub.force_remove_user(&username);
                     hub.update_online_users_list().await;
                 } else {
                     hub.online_users.insert(username.clone(), count - 1);
                     log::debug!("用户 {} 的连接计数更新为: {}", username, count - 1);
                 }
             });
-            
-            send_task.abort();
         });
         
         Ok(())
@@ -692,6 +721,7 @@ impl Hub {
                         let mut inactive_users = std::collections::HashMap::new();
                         let now = SystemTime::now();
                         
+                        // 收集不活跃用户
                         self.clients.iter().for_each(|client| {
                             if let Ok(duration) = now.duration_since(client.value().last_active) {
                                 let hours = duration.as_secs() / 3600; // 转换为小时
@@ -704,26 +734,27 @@ impl Hub {
                             }
                         });
                         
-                        // 移除不活跃用户
-                        let usernames: Vec<String> = inactive_users.keys().cloned().collect();
-                        for username in &usernames {
-                            self.clients.retain(|_, client| {
-                                client.user_info.user_name != *username
-                            });
-                            self.remove_user_session(username);
+                        // 强制移除不活跃用户的所有连接
+                        for username in inactive_users.keys() {
+                            self.force_remove_user(username);
+                        }
+                        
+                        // 更新在线用户列表
+                        if !inactive_users.is_empty() {
+                            self.update_online_users_list().await;
                         }
                         
                         let response = if inactive_users.is_empty() {
-                            "{}".to_string()
+                            json!({}).to_string()
                         } else {
-                            let pairs = serde_json::to_string(&inactive_users).unwrap_or_else(|_| "{}".to_string());
-                            pairs
+                            json!(inactive_users).to_string()
                         };
                         
                         if let Err(e) = socket.send(Message::Text(response)).await {
                             log::error!("发送清理用户响应失败: {}", e);
                             return Err(e.into());
                         }
+                        log::debug!("<------ master: clear")
                     }
                     "online" => {
                         // 直接收集所有连接的用户信息
@@ -791,7 +822,6 @@ impl Hub {
                             // 通知队列处理器
                             let _ = self.queue_sender.send(());
                             
-                            socket.send(Message::Text("OK".to_string())).await?;
                         } else {
                             log::error!("msg 命令参数错误: {}", cmd);
                         }
@@ -854,7 +884,7 @@ impl Hub {
                             self.clients.retain(|_, client| {
                                 client.user_info.user_name != username
                             });
-                            self.remove_user_session(username);
+                            self.force_remove_user(username);
                             socket.send(Message::Text("OK".to_string())).await?;
                         } else {
                             log::error!("kick 命令参数错误: {}", cmd);
