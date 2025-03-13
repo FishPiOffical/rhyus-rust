@@ -243,7 +243,7 @@ impl Hub {
         let username = username.to_string();
         
         tokio::spawn(async move {
-            let mut failed_clients = Vec::new();
+            // let mut failed_clients = Vec::new();
             // let mut sent = false;
             
             // 尝试向用户的所有连接发送消息
@@ -252,7 +252,7 @@ impl Hub {
                 if client.user_info.user_name == username {
                     if let Err(e) = client.tx.send(msg_clone.clone()) {
                         log::error!("向用户 {} 发送消息失败: {}", username, e);
-                        failed_clients.push(entry.key().clone());
+                        // failed_clients.push(entry.key().clone());
                     }
                 }
             }
@@ -348,32 +348,22 @@ impl Hub {
                             
                             log::debug!("开始发送消息给 {} 个连接", connection_count);
                             
-                            // let sender = &msg.sender;
+                            // 在队列处理器中处理所有连接
+                            let sender = &msg.sender;
                             let mut success_count = 0;
                             let mut failed_clients = Vec::new();
+                            let delay_ms = crate::conf::Settings::global().websocket.message_send_delay_ms;
                             
-                            for (addr, username, tx) in clients {
-                                // if &username == sender {
-                                //     continue;
-                                // }
-                                
+                            // 只发送给非发送者的客户端
+                            for (addr, username, tx) in clients.iter().filter(|(_, username, _)| username != sender) {
                                 if let Err(err) = tx.send(WsMessage::new(&msg.content)) {
                                     log::error!("发送消息给客户端失败: {} - {}", username, err);
-                                    failed_clients.push((addr, username));
+                                    failed_clients.push((addr.clone(), username.clone()));
                                 } else {
                                     success_count += 1;
-                                    
-                                    let delay_ms = crate::conf::Settings::global().websocket.message_send_delay_ms;
-                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                                 }
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             }
-                            
-                            // // 移除失败的客户端
-                            // for (addr, username) in failed_clients {
-                            //     if hub.clients.remove(&addr).is_some() {
-                            //         hub.remove_user_session(&username);
-                            //     }
-                            // }
                             
                             // 计算发送持续时间
                             let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
@@ -561,6 +551,15 @@ impl Hub {
                     Message::Close(_) => {
                         log::debug!("客户端主动断开连接: {} ({})", username, addr_clone2);
                         break;
+                    }
+                    Message::Binary(_) => {
+                        log::warn!("收到二进制消息，当前系统不支持处理");
+                    }
+                    Message::Ping(_) => {
+                        log::debug!("收到 Ping 消息");
+                    }
+                    Message::Pong(_) => {
+                        log::debug!("收到 Pong 消息");
                     }
                     _ => {
                         log::warn!("收到客户端未知消息类型");
@@ -780,22 +779,7 @@ impl Hub {
                             let sender = parts[0];
                             let content = parts[1];
                             
-                            let mut sender_found = false;
-                            for entry in self.clients.iter() {
-                                if entry.value().user_info.user_name == sender {
-                                    if let Err(err) = entry.value().tx.send(WsMessage::new(content)) {
-                                        log::error!("直接发送消息给发送者失败: {} - {}", sender, err);
-                                    } else {
-                                        sender_found = true;
-                                        log::debug!("已直接发送消息给发送者: {}", sender);
-                                    }
-                                    break;
-                                }
-                            }
-                            
-                            if !sender_found {
-                                log::debug!("发送者 {} 不在本节点", sender);
-                            }
+                            self.send_to_user(sender, WsMessage::new(content));
                             
                             // 将消息添加到队列
                             let queue_size = {
