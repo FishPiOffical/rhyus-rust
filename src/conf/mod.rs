@@ -16,7 +16,6 @@ pub struct Settings {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
-    pub heartbeat_interval: u64,  // 心跳间隔（秒）
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -27,6 +26,11 @@ pub struct WebSocketConfig {
     pub max_sessions_per_user: usize, // 每个用户最大会话数
     pub message_send_delay_ms: u64, // 消息发送延迟（毫秒）
     pub queue_channel_capacity: usize, // 队列通知通道容量
+    pub task_process_interval_ms: u64, // 任务处理间隔（毫秒）
+    pub default_bandwidth_limit_kb: u64, // 默认带宽限制 (KB/s)
+    pub emergency_queue_ratio: f64, // 紧急队列占用带宽比例 (0-1)
+    pub normal_queue_ratio: f64, // 普通队列占用带宽比例 (0-1)
+    pub slow_queue_ratio: f64, // 慢速队列占用带宽比例 (0-1)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -49,7 +53,6 @@ impl Settings {
             server: ServerConfig {
                 host: "0.0.0.0".to_string(),
                 port: 10831,
-                heartbeat_interval: 30,
             },
             websocket: WebSocketConfig {
                 master_url: "http://localhost:8080".to_string(),
@@ -58,6 +61,11 @@ impl Settings {
                 max_sessions_per_user: 10,
                 message_send_delay_ms: 10, // 默认10毫秒延迟
                 queue_channel_capacity: 100, // 默认队列通道容量
+                task_process_interval_ms: 5, // 默认每5毫秒处理一个任务
+                default_bandwidth_limit_kb: 10000, // 默认10Mbps
+                emergency_queue_ratio: 0.7, // 紧急队列占70%带宽
+                normal_queue_ratio: 0.25, // 普通队列占25%带宽 
+                slow_queue_ratio: 0.05, // 慢速队列占5%带宽
             },
             log: LogConfig {
                 level: "info".to_string(),

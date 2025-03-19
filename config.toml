@@ -2,7 +2,6 @@
 [server]
 host = "0.0.0.0"
 port = 10831
-heartbeat_interval = 30  # 心跳间隔（秒）
 
 # WebSocket配置
 [websocket]
@@ -12,7 +11,12 @@ message_cache_size = 1024  # 消息缓存大小
 max_sessions_per_user = 10  # 每个用户最大会话数
 message_send_delay_ms = 10  # 消息发送延迟（毫秒）
 queue_channel_capacity = 100 # 默认队列通道容量
+task_process_interval_ms = 5 # 默认每10毫秒处理一个任务
+default_bandwidth_limit_kb = 10000 # 默认10Mbps
+emergency_queue_ratio = 0.7 # 紧急队列占70%带宽
+normal_queue_ratio = 0.25 # 普通队列占25%带宽 
+slow_queue_ratio = 0.05 # 慢速队列占5%带宽
 
 # 日志配置
 [log]
-level = "debug" 
+level = "info" 
