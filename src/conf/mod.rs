@@ -31,6 +31,8 @@ pub struct WebSocketConfig {
     pub emergency_queue_ratio: f64, // 紧急队列占用带宽比例 (0-1)
     pub normal_queue_ratio: f64, // 普通队列占用带宽比例 (0-1)
     pub slow_queue_ratio: f64, // 慢速队列占用带宽比例 (0-1)
+    pub api_key_conn_limit_per_minute: u32, // 每个API Key每分钟最大连接数
+    pub global_conn_limit_per_minute: u32, // 全局每分钟最大连接数
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -66,6 +68,8 @@ impl Settings {
                 emergency_queue_ratio: 0.7, // 紧急队列占70%带宽
                 normal_queue_ratio: 0.25, // 普通队列占25%带宽 
                 slow_queue_ratio: 0.05, // 慢速队列占5%带宽
+                api_key_conn_limit_per_minute: 10, // 每个API Key每分钟最大连接数
+                global_conn_limit_per_minute: 120, // 全局每分钟最大连接数
             },
             log: LogConfig {
                 level: "info".to_string(),

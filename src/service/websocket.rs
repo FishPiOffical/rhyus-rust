@@ -428,13 +428,21 @@ impl Hub {
     }
 
     // 广播消息给所有客户端 - 改为将发送任务加入优先级队列
-    fn broadcast_to_clients(&self, msg: WsMessage) {
+    fn broadcast_to_clients(&self, msg: WsMessage, exclude_user: Option<&str>) {
         let hub = self.clone();
         let content = msg.data.clone();
         let priority = msg.priority;
         
         // 首先收集客户端和获取队列大小，避免在异步块中使用MutexGuard
         let clients: Vec<_> = hub.clients.iter()
+            .filter(|entry| {
+                // 如果指定了排除用户，则过滤掉该用户的所有连接
+                if let Some(exclude) = exclude_user {
+                    entry.value().user_info.user_name != exclude
+                } else {
+                    true
+                }
+            })
             .map(|entry| (
                 entry.key().clone(), 
                 entry.value().tx.clone()
@@ -478,32 +486,29 @@ impl Hub {
             queue_size = queue_guard.len();
         }
         
-        log::debug!("准备将消息广播任务加入队列，优先级: {:?}，目标连接数: {}", priority, connection_count);
+        log::debug!("消息广播任务，优先级:{:?}，连接数:{}", priority, connection_count);
         
         tokio::spawn(async move {
             // 更新统计信息
             {
                 let mut stats = hub.msg_stats.write().await;
-                stats.total_msgs += connection_count as u64;
-                stats.queued_tasks += connection_count as u64;
+                stats.total_msgs += 1; // 只计为一条消息
+                stats.queued_tasks += connection_count as u64; // 但是任务数是连接数
                 stats.last_msg_time = now;
                 stats.last_msg_content = content.clone();
                 stats.connection_count = connection_count;
                 
                 // 更新优先级统计
                 match priority {
-                    MessagePriority::Emergency => stats.emergency_msgs_total += connection_count as u64,
-                    MessagePriority::Normal => stats.normal_msgs_total += connection_count as u64,
-                    MessagePriority::Slow => stats.slow_msgs_total += connection_count as u64,
+                    MessagePriority::Emergency => stats.emergency_msgs_total += 1,
+                    MessagePriority::Normal => stats.normal_msgs_total += 1,
+                    MessagePriority::Slow => stats.slow_msgs_total += 1,
                 }
                 
                 if queue_size > stats.queue_max_size {
                     stats.queue_max_size = queue_size;
                 }
             }
-            
-            log::debug!("已将 {} 个优先级 {:?} 的发送任务加入队列，当前队列大小: {}", 
-                      connection_count, priority, queue_size);
             
             // 通知队列处理器
             let _ = hub.queue_sender.send(());
@@ -796,7 +801,7 @@ impl Hub {
         tokio::spawn(async move {
             let mut rx = hub.message_handler.client_out_tx.subscribe();
             while let Ok(msg) = rx.recv().await {
-                hub.broadcast_to_clients(msg);
+                hub.broadcast_to_clients(msg, None);
             }
         });
     }
@@ -1094,83 +1099,7 @@ impl Hub {
         
     }
 
-    // 用于处理主服务器 "msg" 命令 - 支持优先级
-    async fn handle_msg_command(&self, sender: &str, content: &str, priority: MessagePriority) -> AppResult<()> {
-        // 先给发送者自己发送消息
-        let msg = match priority {
-            MessagePriority::Emergency => WsMessage::emergency(content),
-            MessagePriority::Normal => WsMessage::new(content),
-            MessagePriority::Slow => WsMessage::slow(content),
-        };
-        self.send_to_user(sender, msg.clone());
-        
-        // 收集除发送者外的所有客户端
-        let clients: Vec<_> = self.clients.iter()
-            .filter(|entry| entry.value().user_info.user_name != sender)
-            .map(|entry| (
-                entry.key().clone(),
-                entry.value().tx.clone()
-            ))
-            .collect();
-        
-        let connection_count = clients.len();
-        if connection_count == 0 {
-            return Ok(());
-        }
-        
-        let now = SystemTime::now();
-        log::debug!("准备将消息发送任务加入队列，发送者: {}, 优先级: {:?}, 目标连接数: {}", 
-                  sender, priority, connection_count);
-        
-        // 根据优先级选择合适的队列
-        let queue = match priority {
-            MessagePriority::Emergency => &self.emergency_queue,
-            MessagePriority::Normal => &self.normal_queue,
-            MessagePriority::Slow => &self.slow_queue,
-        };
-        
-        // 为每个客户端创建发送任务并加入队列 - 在异步块外使用锁
-        {
-            let mut queue_guard = queue.lock().unwrap();
-            
-            for (addr, tx) in clients.iter() {
-                // 创建发送任务
-                let task = SendTask {
-                    content: content.to_string(),
-                    client_addr: addr.clone(),
-                    client_tx: tx.clone(),
-                    timestamp: now,
-                    priority,
-                };
-                
-                // 加入队列
-                queue_guard.push_back(task);
-            }
-        }
-        
-        // 更新统计信息
-        {
-            let mut stats = self.msg_stats.write().await;
-            stats.total_msgs += 1;
-            stats.queued_tasks += connection_count as u64;
-            stats.last_msg_time = now;
-            stats.last_msg_content = content.to_string();
-            
-            // 更新优先级统计
-            match priority {
-                MessagePriority::Emergency => stats.emergency_msgs_total += 1,
-                MessagePriority::Normal => stats.normal_msgs_total += 1,
-                MessagePriority::Slow => stats.slow_msgs_total += 1,
-            }
-        }
-        
-        // 通知队列处理器
-        let _ = self.queue_sender.send(());
-        
-        Ok(())
-    }
-
-    // 处理主服务器消息 - 修改命令处理
+    // 处理主服务器消息
     async fn handle_master_message(&self, text: &str, socket: &mut WebSocketStream<TcpStream>) -> AppResult<()> {
         if text.contains(":::") {
             let parts: Vec<&str> = text.split(":::").collect();
@@ -1243,9 +1172,9 @@ impl Hub {
                             let sender = parts[0];
                             let content = parts[1];
                             
-                            // 普通消息，使用普通优先级
-                            self.handle_msg_command(sender, content, MessagePriority::Normal).await?;
-                            socket.send(Message::Text("OK".to_string())).await?;
+                            self.send_to_user(sender, WsMessage::new(content));
+                            
+                            self.broadcast_to_clients(WsMessage::new(content), Some(sender));
                         } else {
                             log::error!("msg 命令参数错误: {}", cmd);
                         }
@@ -1254,7 +1183,7 @@ impl Hub {
                         let content = &cmd[4..];
                         if !content.is_empty() {
                             // 紧急消息，使用紧急优先级
-                            self.broadcast_to_clients(WsMessage::emergency(content));
+                            self.broadcast_to_clients(WsMessage::emergency(content), None);
                             socket.send(Message::Text("OK".to_string())).await?;
                         } else {
                             log::error!("all 命令参数错误: {}", cmd);
@@ -1300,7 +1229,7 @@ impl Hub {
                     cmd if cmd.starts_with("slow") => {
                         let content = &cmd[5..];
                         // 慢速消息，使用慢速优先级，延迟为100毫秒
-                        self.broadcast_to_clients(WsMessage::slow(content));
+                        self.broadcast_to_clients(WsMessage::slow(content), None);
                         socket.send(Message::Text("OK".to_string())).await?;
                     }
                     cmd if cmd.starts_with("kick") => {
