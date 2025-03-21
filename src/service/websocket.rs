@@ -1102,7 +1102,7 @@ impl Hub {
     // 处理主服务器消息
     async fn handle_master_message(&self, text: &str, socket: &mut WebSocketStream<TcpStream>) -> AppResult<()> {
         if text.contains(":::") {
-            let parts: Vec<&str> = text.split(":::").collect();
+            let parts: Vec<&str> = text.splitn(2, ":::").collect();
             if parts.len() == 2 && parts[0] == crate::conf::admin_key() {
                 
                 match parts[1] {
