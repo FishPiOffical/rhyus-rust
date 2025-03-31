@@ -7,17 +7,24 @@ port = 10831
 [websocket]
 master_url = "http://127.0.0.1:8080"  # 主服务器地址
 admin_key = "123456"  # 管理员密钥
-message_cache_size = 1024  # 消息缓存大小
+message_cache_size = 512  # 消息缓存大小
 max_sessions_per_user = 10  # 每个用户最大会话数
 message_send_delay_ms = 10  # 消息发送延迟（毫秒）
-queue_channel_capacity = 100 # 默认队列通道容量
-task_process_interval_ms = 5 # 默认每10毫秒处理一个任务
+queue_channel_capacity = 200 # 默认队列通道容量
+task_process_interval_ms = 20 # 默认每10毫秒处理一个任务
 default_bandwidth_limit_kb = 10000 # 默认10Mbps
 emergency_queue_ratio = 0.7 # 紧急队列占70%带宽
 normal_queue_ratio = 0.25 # 普通队列占25%带宽 
 slow_queue_ratio = 0.05 # 慢速队列占5%带宽
 api_key_conn_limit_per_minute = 10 # 每个API Key每分钟最大连接数
 global_conn_limit_per_minute = 120 # 全局每分钟最大连接数
+batch_size = 15  # 默认批处理大小为16
+yield_after_clients = 10 # 每处理5个客户端后让出CPU
+yield_after_tasks = 10 # 每处理10个任务后让出CPU
+yield_sleep_ms = 10 # 让出CPU时的睡眠时间(毫秒)
+batch_delay_base_ms = 50 # 每批次递增50毫秒延迟
+max_batch_delay_ms = 400 # 大批次最大延迟(毫秒)
+max_batch_delay_small_ms = 200 # 小批次最大延迟(毫秒)
 
 # 日志配置
 [log]

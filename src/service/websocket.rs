@@ -113,6 +113,7 @@ struct SendTask {
     priority: MessagePriority,   // 消息优先级
     is_batch: bool,              // 是否为批量任务
     batch_clients: Option<Vec<(String, broadcast::Sender<WsMessage>)>>, // 批量客户端列表
+    batch_delay: Option<Duration>, // 批次延迟时间
 }
 
 // 消息队列统计
@@ -373,6 +374,48 @@ impl TokenBucket {
 }
 
 impl Hub {
+    // 计算批次延迟的函数
+    fn calculate_batch_delay(
+        &self,
+        batch_idx: usize,
+        total_batches: usize,
+        priority: MessagePriority,
+        connection_count: usize
+    ) -> Option<Duration> {
+        // 紧急消息不延迟
+        if priority == MessagePriority::Emergency {
+            return None;
+        }
+        
+        let config = Settings::global();
+        let base_delay = config.websocket.batch_delay_base_ms;
+        
+        // 不需要延迟的情况
+        if base_delay == 0 || total_batches <= 1 {
+            return None;
+        }
+        
+        // 根据连接数量和批次总数动态调整延迟
+        let delay_factor = if connection_count > 100 {
+            0.7 // 大量连接时减少延迟因子
+        } else {
+            1.0 // 中小规模连接使用标准延迟
+        };
+        
+        // 考虑总批次数，避免最后批次延迟过大
+        let max_total_delay = if total_batches > 10 {
+            config.websocket.max_batch_delay_ms // 使用配置的最大延迟值
+        } else {
+            config.websocket.max_batch_delay_small_ms // 使用配置的小批次最大延迟值
+        };
+        
+        // 计算当前批次的延迟时间
+        let delay_ms = ((batch_idx as f64 * base_delay as f64 * delay_factor) as u64)
+            .min(max_total_delay);
+            
+        Some(Duration::from_millis(delay_ms))
+    }
+    
     pub fn new() -> Self {
         let config = Settings::global();
         let message_cache_size = config.websocket.message_cache_size;
@@ -562,8 +605,9 @@ impl Hub {
         }
         
         // 使用批量处理以减少队列大小
-        const BATCH_SIZE: usize = 50; // 每批50个客户端
-        let batch_count = (connection_count + BATCH_SIZE - 1) / BATCH_SIZE;
+        let config = Settings::global();
+        let batch_size = config.websocket.batch_size;
+        let batch_count = (connection_count + batch_size - 1) / batch_size;
         
         // 提前获取队列引用
         let queue = match priority {
@@ -582,20 +626,21 @@ impl Hub {
             
             // 分批处理
             for batch_idx in 0..batch_count {
-                let start = batch_idx * BATCH_SIZE;
-                let end = (start + BATCH_SIZE).min(connection_count);
+                let start = batch_idx * batch_size;
+                let end = (start + batch_size).min(connection_count);
                 let client_batch = &clients[start..end];
                 
                 
-                // 为此批次创建一个任务 - 保持原始消息内容不变
+                // 为此批次创建一个任务
                 let batch_task = SendTask {
-                    content: content.clone(), // 保持原始消息内容不变
+                    content: content.clone(),
                     client_addr: format!("batch_{}_{}", batch_idx, now.elapsed().unwrap_or_default().as_nanos()),
                     client_tx: client_batch[0].1.clone(), // 使用第一个客户端的发送通道作为引用
                     timestamp: now,
                     priority,
                     is_batch: true,
                     batch_clients: Some(client_batch.to_vec()),
+                    batch_delay: self.calculate_batch_delay(batch_idx, batch_count, priority, connection_count),
                 };
                 
                 // 加入队列
@@ -605,8 +650,8 @@ impl Hub {
             queue_size = queue_guard.len();
         }
         
-        log::debug!("消息广播任务，优先级:{:?}，连接数:{}, 批次数:{}", 
-                   priority, connection_count, batch_count);
+        log::debug!("消息广播任务，优先级:{:?}，连接数:{}, 批次数:{}, 每批大小:{}", 
+                   priority, connection_count, batch_count, batch_size);
         
         tokio::spawn(async move {
             // 更新统计信息
@@ -774,26 +819,35 @@ impl Hub {
                             
                             // 处理批量任务或单个任务
                             if task.is_batch && task.batch_clients.is_some() {
+                                // 如果有批次延迟，先等待
+                                if let Some(delay) = task.batch_delay {
+                                    tokio::time::sleep(delay).await;
+                                    log::debug!("批次延迟等待: {}ms, 优先级={:?}", delay.as_millis(), priority);
+                                }
+                                
                                 // 批量发送消息
                                 let batch_clients = task.batch_clients.as_ref().unwrap();
                                 let mut success_count = 0;
                                 let mut fail_count = 0;
                                 
-                                for (client_addr, client_tx) in batch_clients {
+                                let yield_after = config.websocket.yield_after_clients;
+                                let yield_sleep = Duration::from_millis(config.websocket.yield_sleep_ms);
+
+                                for (i, (client_addr, client_tx)) in batch_clients.iter().enumerate() {
                                     // 发送消息给此客户端
                                     match client_tx.send(msg.clone()) {
                                         Ok(_) => success_count += 1,
                                         Err(err) => {
                                             fail_count += 1;
-                                            log::error!("批量任务: 发送{}消息给客户端失败: {} - {}", 
-                                                      format!("{:?}", priority).to_lowercase(), 
-                                                      client_addr, err);
+                                            log::error!("批量任务: 发送消息失败: {} - {}", client_addr, err);
                                         }
                                     }
                                     
-                                    // 每发送10个客户端让出一次CPU时间
-                                    if (success_count + fail_count) % 10 == 0 {
+                                    if (i + 1) % yield_after == 0 {
                                         tokio::task::yield_now().await;
+                                        if yield_sleep.as_millis() > 0 {
+                                            tokio::time::sleep(yield_sleep).await;
+                                        }
                                     }
                                 }
                                 
@@ -825,9 +879,13 @@ impl Hub {
                                 }
                             }
                             
-                            // 每处理5个任务让出一次CPU，防止长时间占用
-                            if i % 5 == 4 {
+                            // 每处理一定数量的任务后让出CPU，防止长时间占用
+                            if i % config.websocket.yield_after_tasks == (config.websocket.yield_after_tasks - 1) {
                                 tokio::task::yield_now().await;
+
+                                if config.websocket.yield_sleep_ms > 0 {
+                                    tokio::time::sleep(Duration::from_millis(config.websocket.yield_sleep_ms / 2)).await;
+                                }
                             }
                         }
                         
@@ -1038,16 +1096,29 @@ impl Hub {
             .unwrap()
             .as_nanos());
         
-        let count = self.online_users.get(&user_info.user_name).map(|v| *v.value()).unwrap_or(0);
+        // 检查连接数限制
+        let count = self.online_users.get(&user_info.user_name)
+            .map(|v| *v.value())
+            .unwrap_or(0);
+        
         let max_sessions = Settings::global().websocket.max_sessions_per_user;
         if count >= max_sessions as i32 {
-            log::warn!("用户 {} 的连接数超过限制: {}/{}", user_info.user_name, count, max_sessions);
-            self.force_remove_user(&user_info.user_name);
+            log::warn!("用户 {} 连接数超限 ({}/{}), 强制移除旧连接",
+                user_info.user_name, count, max_sessions);
+                
+            let username = user_info.user_name.clone();
+            let hub = self.clone();
+            tokio::spawn(async move {
+                hub.force_remove_user(&username);
+            });
+            
             return Ok(());
         }
         
+        // 创建广播通道，优化初始缓冲区大小
         let (tx, _) = broadcast::channel(Settings::global().websocket.message_cache_size);
         
+        // 创建客户端连接记录
         let client = ActiveClient {
             user_info: user_info.clone(),
             tx: tx.clone(),
@@ -1059,43 +1130,43 @@ impl Hub {
         self.clients.insert(addr.clone(), client);
         self.online_users.insert(user_info.user_name.clone(), count + 1);
         
-        // 异步处理用户加入通知和在线列表更新
-        let hub = self.clone();
-        let username = user_info.user_name.clone();
-        tokio::spawn(async move {
-            if is_first_connection {
-                log::debug!("用户 {} 的第一个连接，通知主服务器用户加入", username);
-                if let Err(e) = util::post_message_to_master("join", &username).await {
-                    log::error!("通知主服务器用户加入失败: {}", e);
-                } else {
-                    log::debug!("已通知主服务器用户 {} 加入", username);
+        log::debug!("用户 {} 连接已建立 ({}/{})",
+            user_info.user_name, count + 1, max_sessions);
+        
+        // 处理首次连接的用户
+        if is_first_connection {
+            let hub = self.clone();
+            let username = user_info.user_name.clone();
+            tokio::spawn(async move {
+                log::info!("用户 {} 首次连接，通知主服务器", username);
+                match util::post_message_to_master("join", &username).await {
+                    Ok(_) => log::debug!("已通知主服务器用户 {} 加入", username),
+                    Err(e) => log::error!("通知主服务器失败: {}", e)
                 }
                 
                 // 只在用户第一次连接时更新在线用户列表
                 hub.update_online_users_list().await;
-            }
-        });
-
-        log::debug!("用户 {} 的连接计数: {} (连接ID: {})", user_info.user_name, count + 1, addr);
-        // log::debug!("当前在线用户总数: {}", self.online_users.len());
-
-        // 异步发送在线用户列表给新连接的客户端
+            });
+        }
+        
+        // 发送在线用户列表（异步）
         let client_online_users = self.client_online_users.read().await.clone();
         let users_list = if !client_online_users.is_empty() {
             client_online_users
-        } else {
+        } else if is_first_connection {
             self.all_online_users.read().await.clone()
+        } else {
+            "".to_string()
         };
 
         if users_list != "[]" {
             let hub = self.clone();
             let addr = addr.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 if let Some(client) = hub.clients.get(&addr) {
-                    match client.value().tx.send(WsMessage::new(users_list)) {
-                        Ok(_) => log::debug!("成功发送在线用户列表到客户端"),
-                        Err(e) => log::error!("发送在线用户列表失败: {}", e),
+                    if let Err(e) = client.value().tx.send(WsMessage::slow(users_list)) {
+                        log::error!("发送在线用户列表失败: {}", e);
                     }
                 }
             });
@@ -1107,21 +1178,28 @@ impl Hub {
         let username_clone = user_info.user_name.clone();
         let mut rx = tx.subscribe();
         
-        // 处理发送消息的任务
+        // 消息发送任务
         let send_task = tokio::spawn(async move {
             while let Ok(msg) = rx.recv().await {
+                // 处理延迟发送
                 if let Some(delay) = msg.delay {
-                    tokio::time::sleep(delay).await;
+                    tokio::time::timeout(
+                        std::cmp::min(delay, Duration::from_secs(10)),
+                        tokio::time::sleep(delay)
+                    ).await.unwrap_or(());
                 }
                 
-                if let Err(e) = write.send(Message::Text(msg.data.clone())).await {
-                    log::error!("发送消息到客户端失败 {} ({}): {}", username_clone, addr_clone, e);
-                    
-                    if e.to_string().contains("connection reset") || 
-                       e.to_string().contains("broken pipe") || 
-                       e.to_string().contains("closed") {
-                        log::warn!("客户端连接已关闭，停止发送消息: {} ({})", username_clone, addr_clone);
-                        break;
+                match write.send(Message::Text(msg.data.clone())).await {
+                    Ok(_) => {},
+                    Err(e) => {
+                        log::error!("发送失败 {} ({}): {}", username_clone, addr_clone, e);
+                        
+                        // 连接已关闭，停止发送
+                        if e.to_string().contains("connection reset") || 
+                           e.to_string().contains("broken pipe") || 
+                           e.to_string().contains("closed") {
+                            break;
+                        }
                     }
                 }
             }
@@ -1135,29 +1213,37 @@ impl Hub {
         let username = user_info.user_name.clone();
         
         tokio::spawn(async move {
-            while let Some(Ok(msg)) = read.next().await {
-                match msg {
-                    Message::Text(text) => {
-                        if let Some(mut client) = hub_clone.clients.get_mut(&addr_clone2) {
-                            client.value_mut().last_active = SystemTime::now();
+            while let Some(result) = read.next().await {
+                match result {
+                    Ok(msg) => {
+                        match msg {
+                            Message::Text(text) => {
+                                // 更新活跃时间
+                                if let Some(mut client) = hub_clone.clients.get_mut(&addr_clone2) {
+                                    client.value_mut().last_active = SystemTime::now();
+                                }
+                                log::debug!("收到消息: {} ({}): {}", username, addr_clone2, text);
+                            }
+                            Message::Close(_) => {
+                                log::debug!("客户端断开: {} ({})", username, addr_clone2);
+                                break;
+                            }
+                            _ => {
+                                // 处理其他消息类型，同样更新活跃时间
+                                if let Some(mut client) = hub_clone.clients.get_mut(&addr_clone2) {
+                                    client.value_mut().last_active = SystemTime::now();
+                                }
+                            }
                         }
-                        
-                        log::debug!("收到客户端消息: {} ({}): {}", username, addr_clone2, text);
                     }
-                    Message::Close(_) => {
-                        log::debug!("客户端主动断开连接: {} ({})", username, addr_clone2);
+                    Err(e) => {
+                        log::error!("接收消息错误: {} ({}): {}", username, addr_clone2, e);
                         break;
-                    }
-                    _ => {
-                        if let Some(mut client) = hub_clone.clients.get_mut(&addr_clone2) {
-                            client.value_mut().last_active = SystemTime::now();
-                        }
-                        log::debug!("收到客户端其他类型消息: {} ({}): {:?}", username, addr_clone2, msg);
                     }
                 }
             }
             
-            // 异步处理连接断开
+            // 处理连接断开
             let hub = hub_clone.clone();
             let username = username.clone();
             let addr = addr_clone2.clone();
@@ -1167,10 +1253,12 @@ impl Hub {
                 send_task.abort();
                 
                 // 移除客户端连接
-                if hub.clients.remove(&addr).is_some() {
-                    log::debug!("清理客户端连接: {} ({})", username, addr);
+                let removed = hub.clients.remove(&addr).is_some();
+                if !removed {
+                    return; // 已被其他地方移除
                 }
                 
+                // 更新连接计数
                 let count = hub.online_users.get(&username).map(|v| *v.value()).unwrap_or(0);
                 if count <= 1 {
                     log::debug!("用户 {} 的最后一个连接断开，通知主服务器用户离开", username);
@@ -1178,8 +1266,9 @@ impl Hub {
                     hub.force_remove_user(&username);
                     hub.update_online_users_list().await;
                 } else {
+                    // 更新连接计数
                     hub.online_users.insert(username.clone(), count - 1);
-                    log::debug!("用户 {} 的连接计数更新为: {}", username, count - 1);
+                    log::debug!("用户 {} 连接数: {} -> {}", username, count, count - 1);
                 }
             });
         });
