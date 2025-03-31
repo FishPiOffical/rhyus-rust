@@ -111,6 +111,8 @@ struct SendTask {
     client_tx: broadcast::Sender<WsMessage>, // 目标客户端发送通道
     timestamp: SystemTime,       // 任务创建时间
     priority: MessagePriority,   // 消息优先级
+    is_batch: bool,              // 是否为批量任务
+    batch_clients: Option<Vec<(String, broadcast::Sender<WsMessage>)>>, // 批量客户端列表
 }
 
 // 消息队列统计
@@ -289,8 +291,85 @@ pub struct Hub {
     // 带宽管理
     bandwidth_limit: Arc<tokio::sync::RwLock<u64>>,  // 当前最大带宽限制 (kb/s)
     
+    // 带宽控制器
+    emergency_token_bucket: Arc<tokio::sync::Mutex<TokenBucket>>,  // 紧急消息带宽控制器
+    normal_token_bucket: Arc<tokio::sync::Mutex<TokenBucket>>,     // 普通消息带宽控制器
+    slow_token_bucket: Arc<tokio::sync::Mutex<TokenBucket>>,       // 慢速消息带宽控制器
+    
     // 消息队列统计
     msg_stats: Arc<tokio::sync::RwLock<MsgQueueStats>>,
+}
+
+// 令牌桶算法实现带宽控制
+#[derive(Debug)]
+struct TokenBucket {
+    capacity: u64,         // 桶容量 (kb)
+    tokens: f64,           // 当前令牌数
+    last_refill: SystemTime, // 上次填充时间
+    refill_rate: f64,      // 填充速率 (kb/s)
+    priority: MessagePriority, // 关联的优先级
+}
+
+impl TokenBucket {
+    // 创建新的令牌桶
+    fn new(capacity_kb: u64, rate_kb_per_sec: u64, priority: MessagePriority) -> Self {
+        Self {
+            capacity: capacity_kb,
+            tokens: capacity_kb as f64, // 初始满桶
+            last_refill: SystemTime::now(),
+            refill_rate: rate_kb_per_sec as f64,
+            priority,
+        }
+    }
+    
+    // 尝试消耗指定数量的令牌，返回需要等待的时间
+    fn consume(&mut self, kb: u64) -> Duration {
+        // 先填充令牌
+        let now = SystemTime::now();
+        let elapsed = now.duration_since(self.last_refill).unwrap_or_default();
+        let elapsed_secs = elapsed.as_secs_f64();
+        
+        // 计算新增的令牌数
+        let new_tokens = elapsed_secs * self.refill_rate;
+        self.tokens = (self.tokens + new_tokens).min(self.capacity as f64);
+        self.last_refill = now;
+        
+        // 计算需要等待的时间
+        if (kb as f64) <= self.tokens {
+            // 有足够的令牌，直接消耗
+            self.tokens -= kb as f64;
+            Duration::from_secs(0)
+        } else {
+            // 没有足够的令牌，计算需要等待的时间
+            let missing_tokens = (kb as f64) - self.tokens;
+            let wait_time_secs = missing_tokens / self.refill_rate;
+            
+            // 消耗所有可用令牌
+            self.tokens = 0.0;
+            
+            // 返回需要等待的时间
+            Duration::from_secs_f64(wait_time_secs)
+        }
+    }
+    
+    // 重置令牌桶速率
+    fn reset_rate(&mut self, new_rate_kb_per_sec: u64) {
+        // 先更新当前令牌数
+        let now = SystemTime::now();
+        let elapsed = now.duration_since(self.last_refill).unwrap_or_default();
+        let elapsed_secs = elapsed.as_secs_f64();
+        
+        // 使用旧速率添加令牌
+        let new_tokens = elapsed_secs * self.refill_rate;
+        self.tokens = (self.tokens + new_tokens).min(self.capacity as f64);
+        self.last_refill = now;
+        
+        // 更新速率
+        self.refill_rate = new_rate_kb_per_sec as f64;
+        
+        log::debug!("{:?}优先级令牌桶速率已更新: {}kb/s", 
+                  self.priority, new_rate_kb_per_sec);
+    }
 }
 
 impl Hub {
@@ -305,6 +384,28 @@ impl Hub {
         let message_handler = MessageHandler {
             client_out_tx,
         };
+        
+        // 总带宽限制
+        let total_bandwidth = config.websocket.default_bandwidth_limit_kb;
+        
+        // 创建令牌桶
+        let emergency_bucket = TokenBucket::new(
+            total_bandwidth, 
+            (total_bandwidth as f64 * config.websocket.emergency_queue_ratio) as u64,
+            MessagePriority::Emergency
+        );
+        
+        let normal_bucket = TokenBucket::new(
+            total_bandwidth, 
+            (total_bandwidth as f64 * config.websocket.normal_queue_ratio) as u64,
+            MessagePriority::Normal
+        );
+        
+        let slow_bucket = TokenBucket::new(
+            total_bandwidth, 
+            (total_bandwidth as f64 * config.websocket.slow_queue_ratio) as u64,
+            MessagePriority::Slow
+        );
 
         let hub = Self {
             masters: Arc::new(DashMap::new()),
@@ -321,7 +422,10 @@ impl Hub {
             normal_thread_count: 1,   // 普通消息单线程处理
             emergency_thread_count: 3, // 紧急消息3线程处理 
             slow_thread_count: 2,     // 慢速消息2线程处理
-            bandwidth_limit: Arc::new(tokio::sync::RwLock::new(config.websocket.default_bandwidth_limit_kb)),
+            bandwidth_limit: Arc::new(tokio::sync::RwLock::new(total_bandwidth)),
+            emergency_token_bucket: Arc::new(tokio::sync::Mutex::new(emergency_bucket)),
+            normal_token_bucket: Arc::new(tokio::sync::Mutex::new(normal_bucket)),
+            slow_token_bucket: Arc::new(tokio::sync::Mutex::new(slow_bucket)),
             msg_stats: Arc::new(tokio::sync::RwLock::new(MsgQueueStats::new())),
         };
 
@@ -330,6 +434,9 @@ impl Hub {
         
         // 启动统计监控
         hub.start_msg_stats_monitor();
+        
+        // 启动带宽监控和动态调整
+        hub.start_bandwidth_monitor();
         
         hub
     }
@@ -355,7 +462,7 @@ impl Hub {
         
         // 强制移除不活跃用户的所有连接
         for username in inactive_users.keys() {
-            self.force_remove_user(username);
+            self.force_remove_user(&username);
         }
         
         // 更新在线用户列表
@@ -427,7 +534,7 @@ impl Hub {
         });
     }
 
-    // 广播消息给所有客户端 - 改为将发送任务加入优先级队列
+    // 广播消息给所有客户端 - 改为将发送任务加入优先级队列，使用批量处理
     fn broadcast_to_clients(&self, msg: WsMessage, exclude_user: Option<&str>) {
         let hub = self.clone();
         let content = msg.data.clone();
@@ -454,6 +561,10 @@ impl Hub {
             return;
         }
         
+        // 使用批量处理以减少队列大小
+        const BATCH_SIZE: usize = 50; // 每批50个客户端
+        let batch_count = (connection_count + BATCH_SIZE - 1) / BATCH_SIZE;
+        
         // 提前获取队列引用
         let queue = match priority {
             MessagePriority::Emergency => &hub.emergency_queue,
@@ -461,7 +572,7 @@ impl Hub {
             MessagePriority::Slow => &hub.slow_queue,
         };
         
-        // 为所有客户端创建发送任务并加入队列
+        // 为所有客户端批量创建发送任务并加入队列
         let now = SystemTime::now();
         let mut queue_size = 0;
         
@@ -469,31 +580,40 @@ impl Hub {
         {
             let mut queue_guard = queue.lock().unwrap();
             
-            for (addr, tx) in clients.iter() {
-                // 创建发送任务
-                let task = SendTask {
-                    content: content.clone(),
-                    client_addr: addr.clone(),
-                    client_tx: tx.clone(),
+            // 分批处理
+            for batch_idx in 0..batch_count {
+                let start = batch_idx * BATCH_SIZE;
+                let end = (start + BATCH_SIZE).min(connection_count);
+                let client_batch = &clients[start..end];
+                
+                
+                // 为此批次创建一个任务 - 保持原始消息内容不变
+                let batch_task = SendTask {
+                    content: content.clone(), // 保持原始消息内容不变
+                    client_addr: format!("batch_{}_{}", batch_idx, now.elapsed().unwrap_or_default().as_nanos()),
+                    client_tx: client_batch[0].1.clone(), // 使用第一个客户端的发送通道作为引用
                     timestamp: now,
                     priority,
+                    is_batch: true,
+                    batch_clients: Some(client_batch.to_vec()),
                 };
                 
                 // 加入队列
-                queue_guard.push_back(task);
+                queue_guard.push_back(batch_task);
             }
             
             queue_size = queue_guard.len();
         }
         
-        log::debug!("消息广播任务，优先级:{:?}，连接数:{}", priority, connection_count);
+        log::debug!("消息广播任务，优先级:{:?}，连接数:{}, 批次数:{}", 
+                   priority, connection_count, batch_count);
         
         tokio::spawn(async move {
             // 更新统计信息
             {
                 let mut stats = hub.msg_stats.write().await;
                 stats.total_msgs += 1; // 只计为一条消息
-                stats.queued_tasks += connection_count as u64; // 但是任务数是连接数
+                stats.queued_tasks += batch_count as u64; // 任务数是批次数
                 stats.last_msg_time = now;
                 stats.last_msg_content = content.clone();
                 stats.connection_count = connection_count;
@@ -560,23 +680,50 @@ impl Hub {
             }
         });
         
-        // 为每种优先级的队列启动对应数量的处理线程
-        self.start_emergency_processors();
-        self.start_normal_processors();
-        self.start_slow_processors();
+        // 使用统一函数启动不同优先级的处理线程
+        self.start_priority_processors(
+            MessagePriority::Emergency, 
+            self.emergency_thread_count, 
+            self.emergency_queue.clone(), 
+            1, // 使用基础处理间隔
+            10 // 队列为空时休眠时间(ms)
+        );
+        
+        self.start_priority_processors(
+            MessagePriority::Normal, 
+            self.normal_thread_count, 
+            self.normal_queue.clone(),
+            1, // 使用基础处理间隔
+            20 // 队列为空时休眠时间(ms)
+        );
+        
+        self.start_priority_processors(
+            MessagePriority::Slow, 
+            self.slow_thread_count, 
+            self.slow_queue.clone(),
+            2, // 慢速消息使用2倍处理间隔
+            50 // 队列为空时休眠时间(ms)
+        );
     }
 
-    // 启动紧急消息处理线程
-    fn start_emergency_processors(&self) {
-        // 启动指定数量的紧急消息处理线程
-        for _ in 0..self.emergency_thread_count {
+    // 通用优先级处理器启动函数 - 减少代码重复
+    fn start_priority_processors(
+        &self,
+        priority: MessagePriority,
+        thread_count: usize,
+        queue: Arc<Mutex<VecDeque<SendTask>>>,
+        interval_factor: u64,
+        empty_sleep_ms: u64
+    ) {
+        for _ in 0..thread_count {
             let hub = self.clone();
             let config = Settings::global();
+            let queue = queue.clone();
             
             tokio::spawn(async move {
                 // 处理间隔
                 let process_interval = Duration::from_millis(
-                    config.websocket.task_process_interval_ms
+                    config.websocket.task_process_interval_ms * interval_factor
                 );
                 let mut last_process_time = SystemTime::now();
                 
@@ -587,43 +734,100 @@ impl Hub {
                         tokio::time::sleep(process_interval - elapsed).await;
                     }
                     
-                    // 从紧急队列取出任务
-                    let task = {
-                        let mut queue = hub.emergency_queue.lock().unwrap();
-                        queue.pop_front()
+                    // 批量处理任务 - 最多一次取出10个任务减少锁竞争
+                    let tasks: Vec<SendTask> = {
+                        let mut queue_guard = queue.lock().unwrap();
+                        let count = queue_guard.len().min(10);
+                        (0..count).filter_map(|_| queue_guard.pop_front()).collect()
                     };
                     
-                    if let Some(task) = task {
-                        // 处理紧急发送任务
-                        let msg = WsMessage::emergency(&task.content);
-                        
-                        // 获取当前带宽限制
-                        let total_bandwidth_limit = *hub.bandwidth_limit.read().await;
-                        
-                        // 根据消息大小和带宽限制计算发送延迟
-                        let msg_size_kb = (task.content.len() as f64 / 1024.0).ceil() as u64;
-                        
-                        // 设置紧急消息带宽
-                        let emergency_bandwidth = (total_bandwidth_limit as f64 * config.websocket.emergency_queue_ratio) as u64;
-                        let adjusted_bandwidth = emergency_bandwidth.max(1);
-                        
-                        // 计算此消息需要的发送时间 (毫秒)
-                        let required_time_ms = (msg_size_kb * 1000) / adjusted_bandwidth;
-                        
-                        // 发送消息
-                        if let Err(err) = task.client_tx.send(msg) {
-                            log::error!("发送紧急消息给客户端失败: {} - {}", task.client_addr, err);
-                        } else {
-                            // 更新统计信息
-                            {
-                                let mut stats = hub.msg_stats.write().await;
-                                stats.completed_tasks += 1;
-                                stats.send_duration_ms += required_time_ms;
+                    if !tasks.is_empty() {
+                        // 处理获取的所有任务
+                        for (i, task) in tasks.iter().enumerate() {
+                            // 根据优先级创建消息，保持原始内容不变
+                            let msg = match priority {
+                                MessagePriority::Emergency => WsMessage::emergency(&task.content),
+                                MessagePriority::Normal => WsMessage::new(&task.content),
+                                MessagePriority::Slow => WsMessage::slow(&task.content),
+                            };
+                            
+                            // 计算消息大小 (kb)
+                            let msg_size_kb = (task.content.len() as f64 / 1024.0).ceil() as u64;
+                            
+                            // 获取对应优先级的令牌桶
+                            let token_bucket = match priority {
+                                MessagePriority::Emergency => &hub.emergency_token_bucket,
+                                MessagePriority::Normal => &hub.normal_token_bucket,
+                                MessagePriority::Slow => &hub.slow_token_bucket,
+                            };
+                            
+                            // 获取带宽限制并消耗令牌
+                            let wait_time = {
+                                let mut bucket = token_bucket.lock().await;
+                                bucket.consume(msg_size_kb)
+                            };
+                            
+                            // 如果需要等待，则等待指定时间
+                            if !wait_time.is_zero() {
+                                tokio::time::sleep(wait_time).await;
                             }
                             
-                            // 为了模拟带宽限制，等待计算所需的时间
-                            if required_time_ms > 0 {
-                                tokio::time::sleep(Duration::from_millis(required_time_ms)).await;
+                            // 处理批量任务或单个任务
+                            if task.is_batch && task.batch_clients.is_some() {
+                                // 批量发送消息
+                                let batch_clients = task.batch_clients.as_ref().unwrap();
+                                let mut success_count = 0;
+                                let mut fail_count = 0;
+                                
+                                for (client_addr, client_tx) in batch_clients {
+                                    // 发送消息给此客户端
+                                    match client_tx.send(msg.clone()) {
+                                        Ok(_) => success_count += 1,
+                                        Err(err) => {
+                                            fail_count += 1;
+                                            log::error!("批量任务: 发送{}消息给客户端失败: {} - {}", 
+                                                      format!("{:?}", priority).to_lowercase(), 
+                                                      client_addr, err);
+                                        }
+                                    }
+                                    
+                                    // 每发送10个客户端让出一次CPU时间
+                                    if (success_count + fail_count) % 10 == 0 {
+                                        tokio::task::yield_now().await;
+                                    }
+                                }
+                                
+                                // 更新统计信息
+                                {
+                                    let mut stats = hub.msg_stats.write().await;
+                                    stats.completed_tasks += success_count as u64;
+                                    stats.send_duration_ms += wait_time.as_millis() as u64;
+                                }
+                                
+                                // 记录批量发送结果
+                                log::debug!("批量发送完成: 成功={}, 失败={}, 总计={}, 优先级={:?}, 等待时间={}ms", 
+                                          success_count, fail_count, batch_clients.len(),
+                                          priority, wait_time.as_millis());
+                                
+                            } else {
+                                // 单个发送消息
+                                if let Err(err) = task.client_tx.send(msg.clone()) {
+                                    log::error!("发送{}消息给客户端失败: {} - {}", 
+                                              format!("{:?}", priority).to_lowercase(), 
+                                              task.client_addr, err);
+                                } else {
+                                    // 更新统计信息
+                                    {
+                                        let mut stats = hub.msg_stats.write().await;
+                                        stats.completed_tasks += 1;
+                                        stats.send_duration_ms += wait_time.as_millis() as u64;
+                                    }
+                                }
+                            }
+                            
+                            // 每处理5个任务让出一次CPU，防止长时间占用
+                            if i % 5 == 4 {
+                                tokio::task::yield_now().await;
                             }
                         }
                         
@@ -631,163 +835,7 @@ impl Hub {
                         last_process_time = SystemTime::now();
                     } else {
                         // 队列为空，短暂休眠
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-            });
-        }
-    }
-
-    // 启动普通消息处理线程
-    fn start_normal_processors(&self) {
-        // 启动指定数量的普通消息处理线程
-        for _ in 0..self.normal_thread_count {
-            let hub = self.clone();
-            let config = Settings::global();
-            
-            tokio::spawn(async move {
-                // 处理间隔
-                let process_interval = Duration::from_millis(
-                    config.websocket.task_process_interval_ms
-                );
-                let mut last_process_time = SystemTime::now();
-                
-                loop {
-                    // 控制处理速率
-                    let elapsed = SystemTime::now().duration_since(last_process_time).unwrap_or_default();
-                    if elapsed < process_interval {
-                        tokio::time::sleep(process_interval - elapsed).await;
-                    }
-                    
-                    // 从普通队列取出任务
-                    let task = {
-                        let mut queue = hub.normal_queue.lock().unwrap();
-                        queue.pop_front()
-                    };
-                    
-                    if let Some(task) = task {
-                        // 处理普通发送任务
-                        let msg = WsMessage::new(&task.content);
-                        
-                        // 获取当前带宽限制
-                        let total_bandwidth_limit = *hub.bandwidth_limit.read().await;
-                        
-                        // 根据消息大小和带宽限制计算发送延迟
-                        let msg_size_kb = (task.content.len() as f64 / 1024.0).ceil() as u64;
-                        
-                        // 计算普通消息的带宽
-                        let normal_bandwidth = if hub.emergency_queue.lock().unwrap().is_empty() {
-                            // 如果紧急队列为空，使用正常带宽
-                            (total_bandwidth_limit as f64 * config.websocket.normal_queue_ratio) as u64
-                        } else {
-                            // 如果紧急队列有消息，降低普通队列带宽
-                            (total_bandwidth_limit as f64 * config.websocket.normal_queue_ratio * 0.5) as u64
-                        };
-                        
-                        let adjusted_bandwidth = normal_bandwidth.max(1);
-                        
-                        // 计算此消息需要的发送时间 (毫秒)
-                        let required_time_ms = (msg_size_kb * 1000) / adjusted_bandwidth;
-                        
-                        // 发送消息
-                        if let Err(err) = task.client_tx.send(msg) {
-                            log::error!("发送普通消息给客户端失败: {} - {}", task.client_addr, err);
-                        } else {
-                            // 更新统计信息
-                            {
-                                let mut stats = hub.msg_stats.write().await;
-                                stats.completed_tasks += 1;
-                                stats.send_duration_ms += required_time_ms;
-                            }
-                            
-                            // 为了模拟带宽限制，等待计算所需的时间
-                            if required_time_ms > 0 {
-                                tokio::time::sleep(Duration::from_millis(required_time_ms)).await;
-                            }
-                        }
-                        
-                        // 更新处理时间
-                        last_process_time = SystemTime::now();
-                    } else {
-                        // 队列为空，短暂休眠
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                }
-            });
-        }
-    }
-
-    // 启动慢速消息处理线程
-    fn start_slow_processors(&self) {
-        // 启动指定数量的慢速消息处理线程
-        for _ in 0..self.slow_thread_count {
-            let hub = self.clone();
-            let config = Settings::global();
-            
-            tokio::spawn(async move {
-                // 处理间隔
-                let process_interval = Duration::from_millis(
-                    config.websocket.task_process_interval_ms * 2 // 慢速消息处理间隔更长
-                );
-                let mut last_process_time = SystemTime::now();
-                
-                loop {
-                    // 控制处理速率
-                    let elapsed = SystemTime::now().duration_since(last_process_time).unwrap_or_default();
-                    if elapsed < process_interval {
-                        tokio::time::sleep(process_interval - elapsed).await;
-                    }
-                    
-                    // 从慢速队列取出任务
-                    let task = {
-                        let mut queue = hub.slow_queue.lock().unwrap();
-                        queue.pop_front()
-                    };
-                    
-                    if let Some(task) = task {
-                        // 处理慢速发送任务
-                        let msg = WsMessage::slow(&task.content);
-                        
-                        // 获取当前带宽限制
-                        let total_bandwidth_limit = *hub.bandwidth_limit.read().await;
-                        
-                        // 根据消息大小和带宽限制计算发送延迟
-                        let msg_size_kb = (task.content.len() as f64 / 1024.0).ceil() as u64;
-                        
-                        // 设置慢速消息带宽（固定为总带宽的5%）
-                        let slow_bandwidth = (total_bandwidth_limit as f64 * config.websocket.slow_queue_ratio) as u64;
-                        let adjusted_bandwidth = slow_bandwidth.max(1);
-                        
-                        // 计算此消息需要的发送时间 (毫秒)
-                        let required_time_ms = (msg_size_kb * 1000) / adjusted_bandwidth;
-                        
-                        // 慢速消息先延迟
-                        if let Some(delay) = msg.delay {
-                            tokio::time::sleep(delay).await;
-                        }
-                        
-                        // 发送消息
-                        if let Err(err) = task.client_tx.send(msg) {
-                            log::error!("发送慢速消息给客户端失败: {} - {}", task.client_addr, err);
-                        } else {
-                            // 更新统计信息
-                            {
-                                let mut stats = hub.msg_stats.write().await;
-                                stats.completed_tasks += 1;
-                                stats.send_duration_ms += required_time_ms;
-                            }
-                            
-                            // 为了模拟带宽限制，等待计算所需的时间
-                            if required_time_ms > 0 {
-                                tokio::time::sleep(Duration::from_millis(required_time_ms)).await;
-                            }
-                        }
-                        
-                        // 更新处理时间
-                        last_process_time = SystemTime::now();
-                    } else {
-                        // 队列为空，短暂休眠
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        tokio::time::sleep(Duration::from_millis(empty_sleep_ms)).await;
                     }
                 }
             });
@@ -811,7 +859,7 @@ impl Hub {
         let hub = self.clone();
         
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(600));
+            let mut interval = tokio::time::interval(Duration::from_secs(1800));
             // 添加周期统计变量
             let mut last_total_msgs = 0u64;
             let mut last_completed_tasks = 0u64;
@@ -819,20 +867,12 @@ impl Hub {
             loop {
                 interval.tick().await;
                 
-                // 获取各队列大小
-                let emergency_size = {
-                    let queue = hub.emergency_queue.lock().unwrap();
-                    queue.len()
-                };
-                
-                let normal_size = {
-                    let queue = hub.normal_queue.lock().unwrap();
-                    queue.len()
-                };
-                
-                let slow_size = {
-                    let queue = hub.slow_queue.lock().unwrap();
-                    queue.len()
+                // 获取各队列大小 - 批量获取以减少锁竞争
+                let (emergency_size, normal_size, slow_size) = {
+                    let e_size = hub.emergency_queue.lock().unwrap().len();
+                    let n_size = hub.normal_queue.lock().unwrap().len();
+                    let s_size = hub.slow_queue.lock().unwrap().len();
+                    (e_size, n_size, s_size)
                 };
                 
                 // 获取连接数量
@@ -840,9 +880,6 @@ impl Hub {
                 
                 // 获取带宽限制
                 let bandwidth_limit = *hub.bandwidth_limit.read().await;
-                
-                // 获取配置中的带宽相关比例
-                // let config = Settings::global();
                 
                 // 更新统计信息
                 let mut current_total_msgs = 0;
@@ -884,12 +921,17 @@ impl Hub {
                         (hub.slow_thread_count as f64 / total_threads as f64 * 100.0).round(),
                         total_threads);
                     
-                    // 队列负载统计
+                    // 队列负载统计 - 仅在有队列任务时记录
                     if total_size > 0 {
                         log::info!("队列负载统计 - 紧急: {:.1}个/线程, 普通: {:.1}个/线程, 慢速: {:.1}个/线程",
-                            emergency_size as f64 / hub.emergency_thread_count as f64,
+                            emergency_size as f64 / hub.emergency_thread_count.max(1) as f64,
                             normal_size as f64 / hub.normal_thread_count.max(1) as f64,
                             slow_size as f64 / hub.slow_thread_count.max(1) as f64);
+                        
+                        // 检查队列是否有异常积压
+                        if emergency_size > 1000 || normal_size > 5000 || slow_size > 2000 {
+                            log::warn!("检测到队列异常积压! 请检查系统性能或增加处理线程");
+                        }
                     }
                 }
                 
@@ -908,8 +950,83 @@ impl Hub {
                     0.0
                 };
                 
-                log::info!("周期统计 - 新增消息: {}, 已处理: {}, 完成率: {:.1}%",
-                    period_msgs, period_completed, completion_rate.min(100.0));
+                if period_msgs > 0 || period_completed > 0 {
+                    log::info!("周期统计(30分钟) - 新增消息: {}, 已处理: {}, 完成率: {:.1}%",
+                        period_msgs, period_completed, completion_rate.min(100.0));
+                }
+                
+                // 主动让出一次CPU时间，减少长期任务对系统的影响
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+
+    // 带宽监控和动态调整
+    fn start_bandwidth_monitor(&self) {
+        let hub = self.clone();
+        
+        tokio::spawn(async move {
+            // 检查间隔设置为5分钟
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            
+            loop {
+                interval.tick().await;
+                
+                // 获取当前总带宽限制
+                let total_bandwidth = *hub.bandwidth_limit.read().await;
+                let config = Settings::global();
+                
+                // 获取队列状态用于动态调整带宽分配
+                let emergency_size = hub.emergency_queue.lock().unwrap().len();
+                let normal_size = hub.normal_queue.lock().unwrap().len();
+                let slow_size = hub.slow_queue.lock().unwrap().len();
+                let total_size = emergency_size + normal_size + slow_size;
+                
+                // 根据队列情况动态调整各优先级的带宽分配
+                if total_size > 0 {
+                    // 基础分配比例
+                    let mut emergency_ratio = config.websocket.emergency_queue_ratio;
+                    let mut normal_ratio = config.websocket.normal_queue_ratio;
+                    let mut slow_ratio = config.websocket.slow_queue_ratio;
+                    
+                    // 如果紧急队列有积压，增加紧急队列带宽占比
+                    if emergency_size > 200 {
+                        // 增加紧急队列带宽，减少其他队列带宽
+                        emergency_ratio = (emergency_ratio * 1.5).min(0.8); // 最高占总带宽80%
+                        normal_ratio = ((1.0 - emergency_ratio) * 0.8).max(0.1); // 最低10%
+                        slow_ratio = (1.0 - emergency_ratio - normal_ratio).max(0.05); // 最低5%
+                        
+                        log::info!("检测到紧急队列积压({}), 动态调整带宽分配: 紧急[{:.1}%], 普通[{:.1}%], 慢速[{:.1}%]",
+                                 emergency_size, emergency_ratio * 100.0, 
+                                 normal_ratio * 100.0, slow_ratio * 100.0);
+                    } 
+                    // 如果普通队列有积压但紧急队列较少，增加普通队列带宽占比
+                    else if normal_size > 500 && emergency_size < 50 {
+                        normal_ratio = (normal_ratio * 1.3).min(0.7); // 最高占总带宽70%
+                        emergency_ratio = ((1.0 - normal_ratio) * 0.5).max(0.2); // 最低20%
+                        slow_ratio = (1.0 - emergency_ratio - normal_ratio).max(0.05); // 最低5%
+                        
+                        log::info!("检测到普通队列积压({}), 动态调整带宽分配: 紧急[{:.1}%], 普通[{:.1}%], 慢速[{:.1}%]",
+                                 normal_size, emergency_ratio * 100.0, 
+                                 normal_ratio * 100.0, slow_ratio * 100.0);
+                    }
+                    
+                    // 更新令牌桶速率
+                    {
+                        let mut emergency_bucket = hub.emergency_token_bucket.lock().await;
+                        emergency_bucket.reset_rate((total_bandwidth as f64 * emergency_ratio) as u64);
+                    }
+                    
+                    {
+                        let mut normal_bucket = hub.normal_token_bucket.lock().await;
+                        normal_bucket.reset_rate((total_bandwidth as f64 * normal_ratio) as u64);
+                    }
+                    
+                    {
+                        let mut slow_bucket = hub.slow_token_bucket.lock().await;
+                        slow_bucket.reset_rate((total_bandwidth as f64 * slow_ratio) as u64);
+                    }
+                }
             }
         });
     }
@@ -1355,6 +1472,9 @@ impl Clone for Hub {
             emergency_thread_count: self.emergency_thread_count,
             slow_thread_count: self.slow_thread_count,
             bandwidth_limit: self.bandwidth_limit.clone(),
+            emergency_token_bucket: self.emergency_token_bucket.clone(),
+            normal_token_bucket: self.normal_token_bucket.clone(),
+            slow_token_bucket: self.slow_token_bucket.clone(),
             msg_stats: self.msg_stats.clone(),
         }
     }
