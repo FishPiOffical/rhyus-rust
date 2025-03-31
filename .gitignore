@@ -18,3 +18,4 @@ interrupted_test_results.txt
 link_client.py
 no_message_connections.txt
 ws_test.log
+Cross.toml

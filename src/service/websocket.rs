@@ -1138,7 +1138,7 @@ impl Hub {
             let hub = self.clone();
             let username = user_info.user_name.clone();
             tokio::spawn(async move {
-                log::info!("用户 {} 首次连接，通知主服务器", username);
+                log::debug!("用户 {} 首次连接，通知主服务器", username);
                 match util::post_message_to_master("join", &username).await {
                     Ok(_) => log::debug!("已通知主服务器用户 {} 加入", username),
                     Err(e) => log::error!("通知主服务器失败: {}", e)
@@ -1197,7 +1197,11 @@ impl Hub {
                         // 连接已关闭，停止发送
                         if e.to_string().contains("connection reset") || 
                            e.to_string().contains("broken pipe") || 
-                           e.to_string().contains("closed") {
+                           e.to_string().contains("closed") || 
+                           e.to_string().contains("io error") ||
+                           e.to_string().contains("not connected") ||
+                           e.to_string().contains("protocol error") ||
+                           e.to_string().contains("timed out") {
                             break;
                         }
                     }
