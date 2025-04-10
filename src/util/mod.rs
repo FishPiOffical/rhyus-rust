@@ -28,7 +28,7 @@ pub async fn get_user_info(api_key: &str) -> Option<UserInfo> {
                                 }
                             }
                         } else {
-                            log::error!("No data field in response");
+                            log::error!("No data field in response: {}", result);
                             None
                         }
                     }

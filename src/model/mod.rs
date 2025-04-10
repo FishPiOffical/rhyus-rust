@@ -14,6 +14,8 @@ pub struct UserInfo {
     pub user_city: String,
     #[serde(rename = "userIntro")]
     pub user_intro: String,
+    #[serde(rename = "userNo")]
+    pub user_no: String,
     #[serde(rename = "userOnlineFlag")]
     pub user_online_flag: bool,
     #[serde(rename = "userPoint")]
