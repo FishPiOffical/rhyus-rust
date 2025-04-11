@@ -1241,7 +1241,7 @@ impl Hub {
                         }
                     }
                     Err(e) => {
-                        log::error!("接收消息错误: {} ({}): {}", username, addr_clone2, e);
+                        log::debug!("接收消息错误: {} ({}): {}", username, addr_clone2, e);
                         break;
                     }
                 }

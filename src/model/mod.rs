@@ -47,5 +47,6 @@ pub struct Result<T> {
     pub code: i32,
     pub msg: String,
     pub data: T,
-    pub time: String,
+    #[serde(default)]
+    pub time: Option<String>,
 }
