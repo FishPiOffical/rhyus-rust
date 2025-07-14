@@ -1,2 +1,2 @@
 mod error;
-pub use error::{AppResult, AppError}; 
+pub use error::{AppError, AppResult};

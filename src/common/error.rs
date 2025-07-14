@@ -1,5 +1,5 @@
-use thiserror::Error;
 use std::io;
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -14,7 +14,6 @@ pub enum AppError {
 
     #[error("Request error: {0}")]
     Request(#[from] reqwest::Error),
-
 }
 
-pub type AppResult<T> = Result<T, AppError>; 
+pub type AppResult<T> = Result<T, AppError>;
