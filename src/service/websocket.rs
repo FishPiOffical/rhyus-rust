@@ -675,7 +675,10 @@ impl Hub {
                 stats.total_msgs += 1; // 只计为一条消息
                 stats.queued_tasks += batch_count as u64; // 任务数是批次数
                 stats.last_msg_time = SystemTime::now();
-                stats.last_msg_content = content.as_ref()[..content.len().min(100)].to_string();
+                stats.last_msg_content = content
+                    .chars()
+                    .take(100)
+                    .collect::<String>();
                 stats.connection_count = connection_count;
 
                 // 更新优先级统计
@@ -861,6 +864,19 @@ impl Hub {
                                 let mut fail_count = 0;
 
                                 for (client_addr, client_tx) in batch_clients.iter() {
+                                    // 在发送前检查连接是否仍然存在于clients中
+                                    let is_connection_valid = hub.clients.contains_key(client_addr);
+                                    
+                                    if !is_connection_valid {
+                                        fail_count += 1;
+                                        log::debug!(
+                                            "跳过已断开的连接: {}, 优先级={:?}",
+                                            client_addr,
+                                            priority
+                                        );
+                                        continue;
+                                    }
+
                                     // 发送消息给此客户端
                                     match client_tx.send(msg.clone()) {
                                         Ok(_) => success_count += 1,
