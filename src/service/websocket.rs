@@ -675,10 +675,7 @@ impl Hub {
                 stats.total_msgs += 1; // 只计为一条消息
                 stats.queued_tasks += batch_count as u64; // 任务数是批次数
                 stats.last_msg_time = SystemTime::now();
-                stats.last_msg_content = content
-                    .chars()
-                    .take(100)
-                    .collect::<String>();
+                stats.last_msg_content = content.chars().take(100).collect::<String>();
                 stats.connection_count = connection_count;
 
                 // 更新优先级统计
@@ -814,15 +811,15 @@ impl Hub {
 
                     if !tasks.is_empty() {
                         // 本地统计累积
-                        let mut local_stats = (0u64, 0u64);
-                        
+                        let local_stats = (0u64, 0u64);
+
                         // 处理获取的所有任务
                         for task in tasks.iter() {
                             // 使用任务中的内容创建消息
                             let msg = WsMessage {
-                                data: Arc::clone(&task.content),  // 直接使用Arc引用
-                                delay: task.batch_delay,  // 使用任务中的延迟
-                                priority: task.priority,  // 使用任务中的优先级
+                                data: Arc::clone(&task.content), // 直接使用Arc引用
+                                delay: task.batch_delay,         // 使用任务中的延迟
+                                priority: task.priority,         // 使用任务中的优先级
                             };
 
                             // 计算消息大小 (kb)
@@ -846,42 +843,15 @@ impl Hub {
                                 tokio::time::sleep(wait_time).await;
                             }
 
-                            // 处理批量任务或单个任务
-                            if task.is_batch && task.batch_clients.is_some() {
+                            // 只处理批量任务（单个任务也会被包装成批量）
+                            if let Some(batch_clients) = &task.batch_clients {
                                 // 如果有批次延迟，先等待
                                 if let Some(delay) = task.batch_delay {
                                     tokio::time::sleep(delay).await;
-                                    log::debug!(
-                                        "批次延迟等待: {}ms, 优先级={:?}",
-                                        delay.as_millis(),
-                                        priority
-                                    );
                                 }
-
-                                // 批量发送消息
-                                let batch_clients = task.batch_clients.as_ref().unwrap();
-                                let mut success_count = 0;
-                                let mut fail_count = 0;
-
                                 for (client_addr, client_tx) in batch_clients.iter() {
-                                    // 在发送前检查连接是否仍然存在于clients中
-                                    let is_connection_valid = hub.clients.contains_key(client_addr);
-                                    
-                                    if !is_connection_valid {
-                                        fail_count += 1;
-                                        log::debug!(
-                                            "跳过已断开的连接: {}, 优先级={:?}",
-                                            client_addr,
-                                            priority
-                                        );
-                                        continue;
-                                    }
-
-                                    // 发送消息给此客户端
-                                    match client_tx.send(msg.clone()) {
-                                        Ok(_) => success_count += 1,
-                                        Err(err) => {
-                                            fail_count += 1;
+                                    if hub.clients.contains_key(client_addr) {
+                                        if let Err(err) = client_tx.send(msg.clone()) {
                                             log::error!(
                                                 "批量任务: 发送消息失败: {} - {}",
                                                 client_addr,
@@ -890,17 +860,6 @@ impl Hub {
                                         }
                                     }
                                 }
-
-                                // 累积本地统计
-                                local_stats.0 += success_count as u64;
-                                local_stats.1 += wait_time.as_millis() as u64;
-
-                                // 记录批量发送结果
-                                log::debug!("批量发送完成: 成功={}, 失败={}, 总计={}, 优先级={:?}, 等待时间={}ms", 
-                                          success_count, fail_count, batch_clients.len(),
-                                          priority, wait_time.as_millis());
-                            } else {
-                                log::warn!("单个发送任务");
                             }
                         }
 
@@ -1122,7 +1081,10 @@ impl Hub {
     ) -> AppResult<()> {
         let addr = {
             let now = SystemTime::now();
-            let nanos = now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+            let nanos = now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             format!("{}_{}", user_info.user_name, nanos)
         };
 
@@ -1234,7 +1196,10 @@ impl Hub {
                     .unwrap_or(());
                 }
 
-                match write.send(Message::Text(Arc::as_ref(&msg.data).clone())).await {
+                match write
+                    .send(Message::Text(Arc::as_ref(&msg.data).clone()))
+                    .await
+                {
                     Ok(_) => {}
                     Err(e) => {
                         log::error!("发送失败 {} ({}): {}", username_clone, addr_clone, e);
@@ -1649,4 +1614,3 @@ impl Clone for Hub {
         }
     }
 }
-
