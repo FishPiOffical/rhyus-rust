@@ -8,6 +8,7 @@ const REQUEST_TIMEOUT: u64 = 5;
 
 pub static CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
     reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(REQUEST_TIMEOUT))
         .tcp_keepalive(Duration::from_secs(15))
         .tcp_nodelay(true)
