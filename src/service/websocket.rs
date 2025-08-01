@@ -1562,7 +1562,13 @@ impl Hub {
         let url = format!("{}/chat-room/node/push", crate::conf::master_url());
         log::debug!("发送请求到主服务器: URL={}, 请求体={}", url, message);
 
-        let client = reqwest::Client::new();
+        let client = reqwest::ClientBuilder::new()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|e| crate::common::AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("创建HTTP客户端失败: {}", e),
+            )))?;
         let response = client.post(&url)
             .header("Content-Type", "application/json")
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36")
