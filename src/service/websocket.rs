@@ -1185,40 +1185,45 @@ impl Hub {
 
         // 消息发送任务
         let send_task = tokio::spawn(async move {
-            while let Ok(msg) = rx.recv().await {
-                // 处理延迟发送
-                if let Some(delay) = msg.delay {
-                    tokio::time::timeout(
-                        std::cmp::min(delay, Duration::from_secs(10)),
-                        tokio::time::sleep(delay),
-                    )
-                    .await
-                    .unwrap_or(());
-                }
-
-                match write
-                    .send(Message::Text(Arc::as_ref(&msg.data).clone()))
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::error!("发送失败 {} ({}): {}", username_clone, addr_clone, e);
-
-                        // 连接已关闭，停止发送
-                        if e.to_string().contains("connection reset")
-                            || e.to_string().contains("broken pipe")
-                            || e.to_string().contains("closed")
-                            || e.to_string().contains("io error")
-                            || e.to_string().contains("not connected")
-                            || e.to_string().contains("protocol error")
-                            || e.to_string().contains("timed out")
-                        {
-                            break;
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        if let Some(delay) = msg.delay {
+                            tokio::time::timeout(
+                                std::cmp::min(delay, Duration::from_secs(10)),
+                                tokio::time::sleep(delay),
+                            )
+                            .await
+                            .unwrap_or(());
                         }
+                        match write
+                            .send(Message::Text(Arc::as_ref(&msg.data).clone()))
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => {
+                                log::error!("发送失败 {} ({}): {}", username_clone, addr_clone, e);
+                                let err_str = e.to_string();
+                                if err_str.contains("Broken pipe") || err_str.contains("closed") {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        log::error!(
+                            "广播通道已关闭，发送任务退出: {} ({})",
+                            username_clone,
+                            addr_clone
+                        );
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("消息滞后，丢失{}条: {} ({})", n, username_clone, addr_clone);
                     }
                 }
             }
-
             log::debug!(
                 "客户端消息发送任务结束: {} ({})",
                 username_clone,
@@ -1565,10 +1570,12 @@ impl Hub {
         let client = reqwest::ClientBuilder::new()
             .danger_accept_invalid_certs(true)
             .build()
-            .map_err(|e| crate::common::AppError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("创建HTTP客户端失败: {}", e),
-            )))?;
+            .map_err(|e| {
+                crate::common::AppError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("创建HTTP客户端失败: {}", e),
+                ))
+            })?;
         let response = client.post(&url)
             .header("Content-Type", "application/json")
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36")
