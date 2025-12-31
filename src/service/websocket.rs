@@ -18,6 +18,10 @@ use tokio_tungstenite::{
     tungstenite::{Error as WsError, Message},
     WebSocketStream,
 };
+use std::sync::atomic::Ordering::Acquire;
+use std::time::UNIX_EPOCH;
+use std::sync::atomic::Ordering::Release;
+use std::sync::atomic::Ordering::Relaxed;
 
 impl From<WsError> for AppError {
     fn from(err: WsError) -> Self {
@@ -91,22 +95,20 @@ impl WsMessage {
 /// 原子令牌桶
 #[derive(Debug)]
 struct AtomicTokenBucket {
-    // 使用定点数避免浮点原子操作的问题 (令牌数 * 1000)
     tokens_fp: AtomicU64,
-    capacity_fp: u64,                           // 容量 * 1000
-    refill_rate_fp: u64,                        // 补充速率 * 1000 (每毫秒)
-    last_refill: AtomicU64,  // 上次补充时间戳(毫秒)
+    capacity_fp: u64,
+    refill_rate_fp: u64,
+    last_refill: AtomicU64,
 }
 
 impl AtomicTokenBucket {
     fn new(capacity: f64, refill_rate_per_sec: f64) -> Self {
         let capacity_fp = (capacity * 1000.0) as u64;
-        let refill_rate_fp = (refill_rate_per_sec * 1000.0 / 1000.0) as u64; // 每毫秒
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let refill_rate_fp = (refill_rate_per_sec * 1000.0 / 1000.0) as u64;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-            
         Self {
             tokens_fp: AtomicU64::new(capacity_fp),
             capacity_fp,
@@ -115,134 +117,61 @@ impl AtomicTokenBucket {
         }
     }
 
-    /// 快速检查并尝试消费令牌
     fn try_consume(&self, tokens_needed: f64) -> bool {
         let tokens_needed_fp = (tokens_needed * 1000.0) as u64;
-        
-        // 先尝试补充令牌
         self.try_refill();
-        
-        // 原子性检查并消费令牌
-        loop {
-            let current_tokens = self.tokens_fp.load(Ordering::Acquire);
-            if current_tokens < tokens_needed_fp {
-                return false; // 令牌不足
-            }
-            
-            // 尝试原子性扣除令牌
-            match self.tokens_fp.compare_exchange_weak(
-                current_tokens,
-                current_tokens - tokens_needed_fp,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,  // 成功消费
-                Err(_) => continue,    // 重试
-            }
+        let current = self.tokens_fp.load(Acquire);
+        if current >= tokens_needed_fp {
+            self.tokens_fp.compare_exchange(current, current - tokens_needed_fp, Release, Relaxed).is_ok()
+        } else {
+            false
         }
     }
 
-    /// 尝试补充令牌
     fn try_refill(&self) {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-            
-        let last_ms = self.last_refill.load(Ordering::Relaxed);
-        let elapsed_ms = now_ms.saturating_sub(last_ms);
-        
-        // 只有经过足够时间才补充
-        if elapsed_ms >= 10 { // 至少10ms
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let last_ms = self.last_refill.load(Relaxed);
+        if now_ms - last_ms >= 10 {
+            let elapsed_ms = now_ms - last_ms;
             let new_tokens = elapsed_ms * self.refill_rate_fp;
-            
-            // 原子性更新令牌数和时间戳
-            loop {
-                let current_tokens = self.tokens_fp.load(Ordering::Relaxed);
-                let updated_tokens = (current_tokens + new_tokens).min(self.capacity_fp);
-                
-                if self.tokens_fp.compare_exchange_weak(
-                    current_tokens,
-                    updated_tokens,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ).is_ok() {
-                    // 更新时间戳
-                    self.last_refill.store(now_ms, Ordering::Release);
-                    break;
-                }
+            let current = self.tokens_fp.load(Relaxed);
+            let updated = (current + new_tokens).min(self.capacity_fp);
+            if self.tokens_fp.compare_exchange(current, updated, Release, Relaxed).is_ok() {
+                self.last_refill.store(now_ms, Release);
             }
         }
     }
 
-    /// 等待并消费令牌
     async fn consume(&self, tokens_needed: f64) {
-        let start_time = Instant::now();
-        let mut wait_count = 0;
-        
         loop {
-            // 先尝试快速消费
             if self.try_consume(tokens_needed) {
-                if wait_count > 0 {
-                    log::debug!("令牌获取成功，等待时间: {:.2}ms, 等待轮次: {}", 
-                              start_time.elapsed().as_millis(), wait_count);
-                }
                 return;
             }
-            
-            wait_count += 1;
-            if wait_count == 1 {
-                let current_fp = self.tokens_fp.load(Ordering::Relaxed);
-                log::debug!("令牌不足，开始等待。需要: {:.1}, 当前: {:.1}, 速率: {:.1}/s", 
-                           tokens_needed, current_fp as f64 / 1000.0, self.refill_rate_fp as f64);
-            }
-            
-            // 计算等待时间
-            let tokens_needed_fp = (tokens_needed * 1000.0) as u64;
-            let current_tokens = self.tokens_fp.load(Ordering::Relaxed);
-            let deficit_fp = tokens_needed_fp.saturating_sub(current_tokens);
+            let deficit_fp = (tokens_needed * 1000.0) as u64 - self.tokens_fp.load(Relaxed);
             let wait_ms = deficit_fp / self.refill_rate_fp.max(1);
-            
-            // 等待，但至少1ms，最多100ms（避免过长等待）
-            let wait_duration = std::time::Duration::from_millis(wait_ms.clamp(1, 100));
-            tokio::time::sleep(wait_duration).await;
+            tokio::time::sleep(Duration::from_millis(wait_ms.clamp(1, 100))).await;
         }
     }
 
-    /// 批量消费
-    async fn consume_batch(&self, messages: &[(f64, MessagePriority)]) -> Vec<bool> {
-        let mut results = vec![false; messages.len()];
-        let mut remaining_indices = Vec::new();
-        
-        // 第一轮：尝试无锁消费
-        for (i, &(tokens_needed, _)) in messages.iter().enumerate() {
+    async fn consume_batch(&self, requests: &[(f64, MessagePriority)]) -> Vec<bool> {
+        let mut results = vec![false; requests.len()];
+        for (i, &(tokens_needed, _)) in requests.iter().enumerate() {
             if self.try_consume(tokens_needed) {
                 results[i] = true;
-            } else {
-                remaining_indices.push(i);
             }
         }
-        
-        // 第二轮：对剩余的消息依次等待消费
-        for &i in &remaining_indices {
-            let (tokens_needed, priority) = messages[i];
-            // 为紧急消息提供更快的处理
-            if priority == MessagePriority::Emergency {
-                self.consume(tokens_needed).await;
-                results[i] = true;
-            } else {
-                // 普通和低优先级消息可以有轻微延迟
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(50), 
-                    self.consume(tokens_needed)
-                ).await.unwrap_or_default();
-                results[i] = self.try_consume(tokens_needed);
+        for (i, &(tokens_needed, priority)) in requests.iter().enumerate() {
+            if !results[i] {
+                if priority == MessagePriority::Emergency {
+                    self.consume(tokens_needed).await;
+                    results[i] = true;
+                } else {
+                    results[i] = tokio::time::timeout(Duration::from_millis(50), self.consume(tokens_needed)).await.is_ok();
+                }
             }
         }
-        
         results
     }
-
 }
 
 /// 客户端连接信息
@@ -260,23 +189,12 @@ impl ClientConnection {
     fn new(user_info: UserInfo, connection_id: u64) -> Self {
         let config = Settings::global();
         let (sender, _) = broadcast::channel(config.websocket.message_cache_size);
-        
-        // // 从配置文件获取带宽限制
-        // let bandwidth_kb_per_sec = config.websocket.default_bandwidth_limit_kb as f64;
-        // // 转换为每秒令牌数（每KB = 1个令牌）
-        // let tokens_per_sec = bandwidth_kb_per_sec;
-        // // 令牌桶容量为2秒的带宽量，允许突发流量
-        // let capacity = tokens_per_sec * 2.0;
-        
-        // let token_bucket = Arc::new(tokio::sync::Mutex::new(TokenBucket::new(capacity, tokens_per_sec)));
-        
+
         Self {
             user_info,
             sender,
             last_active: SystemTime::now(),
             connection_id,
-            // token_bucket,
-            // message_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -487,16 +405,71 @@ impl Hub {
         log::info!("  - 每连接令牌桶容量: {:.0} 令牌", config.websocket.default_bandwidth_limit_kb as f64 * 2.0);
     }
 
-    // pub async fn broadcast_online_users(&self) {
-    //     let online_users_json = self.get_online_users_json();
-    //     let message = WsMessage::emergency(online_users_json);
-        
-    //     if let Err(e) = self.emergency_sender.send(message) {
-    //         log::error!("推送在线用户列表失败: {}", e);
-    //     } else {
-    //         log::debug!("已实时推送在线用户列表更新");
-    //     }
-    // }
+    /// 批量消费令牌
+    async fn consume_tokens_batch(
+        normal_bucket: &AtomicTokenBucket,
+        low_bucket: &AtomicTokenBucket,
+        messages: &[WsMessage],
+    ) -> (Vec<bool>, Vec<bool>) {
+        let mut normal_requests = Vec::new();
+        let mut low_requests = Vec::new();
+        for msg in messages {
+            if msg.priority != MessagePriority::Emergency {
+                let size_kb = (msg.size_bytes as f64 / 1024.0).max(1.0);
+                match msg.priority {
+                    MessagePriority::Normal => normal_requests.push((size_kb, msg.priority)),
+                    MessagePriority::Low => low_requests.push((size_kb, msg.priority)),
+                    _ => {}
+                }
+            }
+        }
+        tokio::join!(
+            async { if normal_requests.is_empty() { vec![] } else { normal_bucket.consume_batch(&normal_requests).await } },
+            async { if low_requests.is_empty() { vec![] } else { low_bucket.consume_batch(&low_requests).await } }
+        )
+    }
+    
+    /// 发送消息到对应通道
+    fn send_messages_to_channels(
+        emergency_sender: &broadcast::Sender<WsMessage>,
+        normal_sender: &broadcast::Sender<WsMessage>,
+        low_sender: &broadcast::Sender<WsMessage>,
+        messages: Vec<WsMessage>,
+    ) {
+        for msg in messages {
+            let sender = match msg.priority {
+                MessagePriority::Emergency => emergency_sender,
+                MessagePriority::Normal => normal_sender,
+                MessagePriority::Low => low_sender,
+            };
+            if let Err(e) = sender.send(msg) {
+                log::error!("发送消息失败: {}", e);
+            }
+        }
+    }
+    
+    /// 刷新缓冲区并发送
+    async fn flush_buffer_with_tokens(
+        buffer: &Arc<tokio::sync::Mutex<MessageBuffer>>,
+        normal_bucket: &AtomicTokenBucket,
+        low_bucket: &AtomicTokenBucket,
+        emergency_sender: &broadcast::Sender<WsMessage>,
+        normal_sender: &broadcast::Sender<WsMessage>,
+        low_sender: &broadcast::Sender<WsMessage>,
+    ) {
+        let mut buf = buffer.lock().await;
+        if buf.should_flush() {
+            let messages = buf.flush();
+            drop(buf);
+            if !messages.is_empty() {
+                let (normal_results, low_results) = Self::consume_tokens_batch(normal_bucket, low_bucket, &messages).await;
+                log::debug!("批量令牌消费: Normal={}/{}, Low={}/{}",
+                    normal_results.iter().filter(|&&r| r).count(), normal_results.len(),
+                    low_results.iter().filter(|&&r| r).count(), low_results.len());
+                Self::send_messages_to_channels(emergency_sender, normal_sender, low_sender, messages);
+            }
+        }
+    }
 
     /// 添加客户端连接
     pub async fn add_client(&self, socket: WebSocketStream<TcpStream>, user_info: UserInfo) -> AppResult<()> {
@@ -766,190 +739,57 @@ impl Hub {
 
     /// 广播消息给所有客户端
     pub async fn broadcast_message(&self, message: WsMessage) {
-        // 计算实际的消息负载（1个广播请求 = 在线用户数个实际消息）
         let online_count = self.online_users.len() as u64;
         self.frequency_monitor.record_message_load(online_count.max(1));
         
-        // 紧急消息始终直接发送
         if message.priority == MessagePriority::Emergency {
-            self.direct_send_message(message).await;
+            if let Err(e) = self.emergency_sender.send(message) {
+                log::error!("紧急消息发送失败: {}", e);
+            }
             return;
         }
         
-        // 根据当前频率模式选择处理路径
-        let processing_mode = self.frequency_monitor.get_current_mode();
-        
-        match processing_mode {
+        match self.frequency_monitor.get_current_mode() {
             ProcessingMode::Direct => {
-                log::debug!("直接发送模式: 立即发送消息");
-                self.direct_send_message(message).await;
+                let size_kb = (message.size_bytes as f64 / 1024.0).max(1.0);
+                let bucket = match message.priority {
+                    MessagePriority::Normal => &self.normal_token_bucket,
+                    MessagePriority::Low => &self.low_token_bucket,
+                    _ => return,
+                };
+                bucket.consume(size_kb).await;
+                let sender = match message.priority {
+                    MessagePriority::Normal => &self.normal_sender,
+                    MessagePriority::Low => &self.low_sender,
+                    _ => return,
+                };
+                if let Err(e) = sender.send(message) {
+                    log::error!("直接发送失败: {}", e);
+                }
             }
             ProcessingMode::MicroBatch => {
-                log::debug!("微批处理模式: 添加到微批缓冲区");
-                self.micro_batch_send_message(message).await;
+                Self::flush_buffer_with_tokens(
+                    &self.micro_batch_buffer,
+                    &self.normal_token_bucket,
+                    &self.low_token_bucket,
+                    &self.emergency_sender,
+                    &self.normal_sender,
+                    &self.low_sender,
+                ).await;
             }
             ProcessingMode::Batch => {
-                log::debug!("批量处理模式: 添加到批量缓冲区");
-                self.batch_send_message(message).await;
+                Self::flush_buffer_with_tokens(
+                    &self.batch_buffer,
+                    &self.normal_token_bucket,
+                    &self.low_token_bucket,
+                    &self.emergency_sender,
+                    &self.normal_sender,
+                    &self.low_sender,
+                ).await;
             }
         }
     }
 
-    /// 直接发送消息
-    async fn direct_send_message(&self, message: WsMessage) {
-        // 对于非紧急消息，进行速率控制
-        if message.priority != MessagePriority::Emergency {
-            let msg_size_kb = (message.size_bytes as f64 / 1024.0).max(1.0);
-            let token_bucket = match message.priority {
-                MessagePriority::Emergency => unreachable!(),
-                MessagePriority::Normal => &self.normal_token_bucket,
-                MessagePriority::Low => &self.low_token_bucket,
-            };
-            
-            // 使用原子令牌桶的无锁消费
-            token_bucket.consume(msg_size_kb).await;
-        }
-        
-        // 立即发送到对应通道
-        let sender = match message.priority {
-            MessagePriority::Emergency => &self.emergency_sender,
-            MessagePriority::Normal => &self.normal_sender,
-            MessagePriority::Low => &self.low_sender,
-        };
-        
-        if let Err(e) = sender.send(message) {
-            log::error!("直接发送消息失败: {}", e);
-        }
-    }
-
-    /// 微批处理发送消息
-    async fn micro_batch_send_message(&self, message: WsMessage) {
-        let mut buffer = self.micro_batch_buffer.lock().await;
-        buffer.push(message);
-        
-        // 检查是否需要立即刷新
-        if buffer.should_flush() {
-            let messages = buffer.flush();
-            drop(buffer); // 释放锁
-            
-            log::debug!("微批缓冲区已满，发送 {} 条消息", messages.len());
-            
-            // 使用批量消费优化性能
-            let mut normal_requests = Vec::new();
-            let mut low_requests = Vec::new();
-            
-            for message in &messages {
-                if message.priority != MessagePriority::Emergency {
-                    let msg_size_kb = (message.size_bytes as f64 / 1024.0).max(1.0);
-                    match message.priority {
-                        MessagePriority::Normal => normal_requests.push((msg_size_kb, message.priority)),
-                        MessagePriority::Low => low_requests.push((msg_size_kb, message.priority)),
-                        MessagePriority::Emergency => unreachable!(),
-                    }
-                }
-            }
-            
-            // 批量消费令牌（支持普通和低优先级消息并发处理）
-            let (normal_results, low_results) = tokio::join!(
-                async {
-                    if !normal_requests.is_empty() {
-                        self.normal_token_bucket.consume_batch(&normal_requests).await
-                    } else {
-                        vec![]
-                    }
-                },
-                async {
-                    if !low_requests.is_empty() {
-                        self.low_token_bucket.consume_batch(&low_requests).await
-                    } else {
-                        vec![]
-                    }
-                }
-            );
-            
-            log::debug!("批量令牌消费结果: Normal={}/{}, Low={}/{}", 
-                normal_results.iter().filter(|&&r| r).count(), normal_requests.len(),
-                low_results.iter().filter(|&&r| r).count(), low_requests.len());
-            
-            // 发送每条消息到对应通道
-            for message in messages {
-                // 发送到对应通道
-                let sender = match message.priority {
-                    MessagePriority::Emergency => &self.emergency_sender,
-                    MessagePriority::Normal => &self.normal_sender,
-                    MessagePriority::Low => &self.low_sender,
-                };
-                
-                if let Err(e) = sender.send(message) {
-                    log::error!("微批消息发送失败: {}", e);
-                }
-            }
-        }
-    }
-
-    /// 批量处理发送消息
-    async fn batch_send_message(&self, message: WsMessage) {
-        let mut buffer = self.batch_buffer.lock().await;
-        buffer.push(message);
-        
-        // 检查是否需要立即刷新
-        if buffer.should_flush() {
-            let messages = buffer.flush();
-            drop(buffer); // 释放锁
-            
-            log::debug!("批量缓冲区已满，发送 {} 条消息", messages.len());
-            
-            // 准备批量令牌请求
-            let mut normal_requests = Vec::new();
-            let mut low_requests = Vec::new();
-            
-            for message in &messages {
-                if message.priority != MessagePriority::Emergency {
-                    let msg_size_kb = (message.size_bytes as f64 / 1024.0).max(1.0);
-                    match message.priority {
-                        MessagePriority::Normal => normal_requests.push((msg_size_kb, message.priority)),
-                        MessagePriority::Low => low_requests.push((msg_size_kb, message.priority)),
-                        MessagePriority::Emergency => unreachable!(),
-                    }
-                }
-            }
-            
-            // 并发批量消费令牌
-            let (normal_results, low_results) = tokio::join!(
-                async {
-                    if !normal_requests.is_empty() {
-                        self.normal_token_bucket.consume_batch(&normal_requests).await
-                    } else {
-                        vec![]
-                    }
-                },
-                async {
-                    if !low_requests.is_empty() {
-                        self.low_token_bucket.consume_batch(&low_requests).await
-                    } else {
-                        vec![]
-                    }
-                }
-            );
-            
-            log::debug!("批量令牌消费结果: Normal={}/{}, Low={}/{}", 
-                normal_results.iter().filter(|&&r| r).count(), normal_requests.len(),
-                low_results.iter().filter(|&&r| r).count(), low_requests.len());
-            
-            // 发送所有消息到对应通道
-            for message in messages {
-                let sender = match message.priority {
-                    MessagePriority::Emergency => &self.emergency_sender,
-                    MessagePriority::Normal => &self.normal_sender,
-                    MessagePriority::Low => &self.low_sender,
-                };
-                
-                if let Err(e) = sender.send(message) {
-                    log::error!("批量消息发送失败: {}", e);
-                }
-            }
-        }
-    }
 
     /// 广播消息给除指定用户外的所有客户端  
     pub fn broadcast_message_except(&self, message: WsMessage, exclude_username: &str) {
@@ -1310,119 +1150,8 @@ impl Hub {
         normal_sender: &broadcast::Sender<WsMessage>,
         low_sender: &broadcast::Sender<WsMessage>,
     ) {
-        // 检查微批处理缓冲区
-        {
-            let mut buffer = micro_batch_buffer.lock().await;
-            if buffer.should_flush() {
-                let messages = buffer.flush();
-                if !messages.is_empty() {
-                    log::debug!("定时刷新微批缓冲区: {} 条消息", messages.len());
-                    
-                    // 准备批量令牌请求
-                    let mut normal_requests = Vec::new();
-                    let mut low_requests = Vec::new();
-                    
-                    for message in &messages {
-                        if message.priority != MessagePriority::Emergency {
-                            let msg_size_kb = (message.size_bytes as f64 / 1024.0).max(1.0);
-                            match message.priority {
-                                MessagePriority::Normal => normal_requests.push((msg_size_kb, message.priority)),
-                                MessagePriority::Low => low_requests.push((msg_size_kb, message.priority)),
-                                MessagePriority::Emergency => unreachable!(),
-                            }
-                        }
-                    }
-                    
-                    // 并发批量消费令牌
-                    let (_normal_results, _low_results) = tokio::join!(
-                        async {
-                            if !normal_requests.is_empty() {
-                                normal_token_bucket.consume_batch(&normal_requests).await
-                            } else {
-                                vec![]
-                            }
-                        },
-                        async {
-                            if !low_requests.is_empty() {
-                                low_token_bucket.consume_batch(&low_requests).await
-                            } else {
-                                vec![]
-                            }
-                        }
-                    );
-                    
-                    // 发送所有消息到对应通道
-                    for message in messages {
-                        let sender = match message.priority {
-                            MessagePriority::Emergency => emergency_sender,
-                            MessagePriority::Normal => normal_sender,
-                            MessagePriority::Low => low_sender,
-                        };
-                        
-                        if let Err(e) = sender.send(message) {
-                            log::error!("定时刷新消息发送失败: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 检查批量处理缓冲区
-        {
-            let mut buffer = batch_buffer.lock().await;
-            if buffer.should_flush() {
-                let messages = buffer.flush();
-                if !messages.is_empty() {
-                    log::debug!("定时刷新批量缓冲区: {} 条消息", messages.len());
-                    
-                    // 准备批量令牌请求
-                    let mut normal_requests = Vec::new();
-                    let mut low_requests = Vec::new();
-                    
-                    for message in &messages {
-                        if message.priority != MessagePriority::Emergency {
-                            let msg_size_kb = (message.size_bytes as f64 / 1024.0).max(1.0);
-                            match message.priority {
-                                MessagePriority::Normal => normal_requests.push((msg_size_kb, message.priority)),
-                                MessagePriority::Low => low_requests.push((msg_size_kb, message.priority)),
-                                MessagePriority::Emergency => unreachable!(),
-                            }
-                        }
-                    }
-                    
-                    // 并发批量消费令牌
-                    let (_normal_results, _low_results) = tokio::join!(
-                        async {
-                            if !normal_requests.is_empty() {
-                                normal_token_bucket.consume_batch(&normal_requests).await
-                            } else {
-                                vec![]
-                            }
-                        },
-                        async {
-                            if !low_requests.is_empty() {
-                                low_token_bucket.consume_batch(&low_requests).await
-                            } else {
-                                vec![]
-                            }
-                        }
-                    );
-                    
-                    // 发送所有消息到对应通道
-                    for message in messages {
-                        let sender = match message.priority {
-                            MessagePriority::Emergency => emergency_sender,
-                            MessagePriority::Normal => normal_sender,
-                            MessagePriority::Low => low_sender,
-                        };
-                        
-                        if let Err(e) = sender.send(message) {
-                            log::error!("定时刷新消息发送失败: {}", e);
-                        }
-                    }
-                }
-            }
-        }
+        Self::flush_buffer_with_tokens(micro_batch_buffer, normal_token_bucket, low_token_bucket, emergency_sender, normal_sender, low_sender).await;
+        Self::flush_buffer_with_tokens(batch_buffer, normal_token_bucket, low_token_bucket, emergency_sender, normal_sender, low_sender).await;
     }
 }
 
