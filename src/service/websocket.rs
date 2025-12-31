@@ -674,12 +674,36 @@ impl Hub {
         sink: &mut futures::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
         ws_msg: &WsMessage,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 如果有延迟，先等待
+        use tokio_tungstenite::tungstenite::protocol::frame::{Frame, coding::{OpCode, Data}};
+
+        const FRAME_SIZE: usize = 64 * 1024;
+
         if let Some(delay) = ws_msg.delay {
             tokio::time::sleep(delay).await;
         }
 
-        sink.send(Message::Text(ws_msg.content.clone())).await?;
+        let bytes = ws_msg.content.as_bytes();
+
+        if bytes.len() <= FRAME_SIZE {
+            sink.send(Message::Text(ws_msg.content.clone())).await?;
+        } else {
+            let chunks: Vec<&[u8]> = bytes.chunks(FRAME_SIZE).collect();
+            let total = chunks.len();
+
+            for (i, chunk) in chunks.into_iter().enumerate() {
+                let is_first = i == 0;
+                let is_last = i == total - 1;
+
+                let frame = if is_first {
+                    Frame::message(chunk.to_vec(), OpCode::Data(Data::Text), is_last)
+                } else {
+                    Frame::message(chunk.to_vec(), OpCode::Data(Data::Continue), is_last)
+                };
+
+                sink.send(Message::Frame(frame)).await?;
+            }
+        }
+
         Ok(())
     }
 
