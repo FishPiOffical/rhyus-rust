@@ -1009,6 +1009,10 @@ impl Hub {
 
     /// 添加主服务器连接
     pub async fn add_master(&self, socket: WebSocketStream<TcpStream>) -> AppResult<()> {
+        use tokio_tungstenite::tungstenite::protocol::frame::{Frame, coding::{OpCode, Data}};
+
+        const FRAME_SIZE: usize = 64 * 1024;
+
         let (mut sink, mut stream) = socket.split();
         
         while let Some(result) = stream.next().await {
@@ -1016,9 +1020,33 @@ impl Hub {
                 Ok(Message::Text(text)) => {
                     match self.handle_master_message(&text).await {
                         Ok(response) => {
-                            if let Err(e) = sink.send(Message::Text(response)).await {
-                                log::error!("发送响应失败: {}", e);
-                                break;
+                            let bytes = response.as_bytes();
+
+                            if bytes.len() <= FRAME_SIZE {
+                                if let Err(e) = sink.send(Message::Text(response)).await {
+                                    log::error!("发送响应失败: {}", e);
+                                    break;
+                                }
+                            } else {
+                                let chunks: Vec<&[u8]> = bytes.chunks(FRAME_SIZE).collect();
+                                let total = chunks.len();
+
+                                for (i, chunk) in chunks.into_iter().enumerate() {
+                                    let is_first = i == 0;
+                                    let is_last = i == total - 1;
+
+                                    let frame = if is_first {
+                                        Frame::message(chunk.to_vec(), OpCode::Data(Data::Text), is_last)
+                                    } else {
+                                        Frame::message(chunk.to_vec(), OpCode::Data(Data::Continue), is_last)
+                                    };
+
+                                    if let Err(e) = sink.send(Message::Frame(frame)).await {
+                                        log::error!("发送分片失败: {}", e);
+                                        break;
+                                    }
+                                }
+                                // log::info!("大消息分片发送完成，共 {} 帧", total);
                             }
                         }
                         Err(e) => {
